@@ -1,0 +1,14 @@
+# Runtime state / user data
+storage.json
+sandbox/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Personal notes (not part of the project)
+extra-info.md
+
+# Editor / OS junk
+*.swp
+.DS_Store

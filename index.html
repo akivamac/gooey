@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#faf8f5">
+<link rel="manifest" href="manifest.json">
+<title>gooey</title>
+<script src="vendor/dompurify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous"></script>
+<script src="vendor/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+<script src="vendor/highlight.min.js" integrity="sha384-TYVqec4LXq2Z/J7Nr2BoNe/GdlRb+GVUP63Sm8Ov5CsMMo307TpfbF3UUUB6zV4J" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header"><h2>gooey</h2></div>
+  <button class="new-chat-btn" id="new-chat-btn">+ New Chat</button>
+  <button class="new-project-btn" id="projects-btn">Projects</button>
+  <div class="unorganized-header">Chats</div>
+  <div class="sidebar-list" id="sidebar-list"></div>
+  <button class="new-project-btn" id="clear-everything-btn" style="color:var(--danger);border-color:var(--danger);margin:8px">Clear Everything</button>
+</aside>
+<div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+<div class="main">
+
+  <div class="topbar">
+    <button class="sidebar-toggle" id="sidebar-toggle" title="Menu">&#9783;</button>
+    <h1 id="topbar-title">gooey</h1>
+    <div class="topbar-right" style="position:relative">
+      <button class="topbar-btn" id="files-toggle" title="Files">&#128193;</button>
+      <button class="topbar-btn" id="search-toggle" title="Search conversations">&#128269;</button>
+      <button class="topbar-btn" id="project-settings-btn" title="Project settings" style="display:none">Settings</button>
+      <button class="topbar-btn" id="theme-toggle" title="Toggle theme">&#9789;</button>
+      <button class="topbar-btn" id="export-btn" title="Copy conversation">Export</button>
+      <button class="topbar-btn" id="export-file-btn" title="Download as .md">&#11015;</button>
+      <div class="search-panel" id="search-panel">
+        <input type="text" id="search-input" placeholder="Search all conversations...">
+        <div class="search-results" id="search-results"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="chat" id="chat" style="position:relative">
+    <div class="chat-inner" id="chat-inner"></div>
+    <div class="drag-overlay" id="drag-overlay"><span>Drop files to attach</span></div>
+  </div>
+
+  <div class="compact-banner" id="compact-banner">
+    <div class="compact-message">Compacting conversation...</div>
+    <div class="compact-progress"><div class="compact-progress-fill" id="compact-progress-fill"></div></div>
+  </div>
+
+  <div class="input-area">
+    <div class="input-wrap">
+      <div class="input-container">
+        <textarea id="input" rows="1" placeholder="Type a message..."></textarea>
+        <div class="attach-bar" id="attach-bar"></div>
+        <div class="input-bottom">
+          <div class="add-menu-wrap">
+            <button class="input-feat-btn" id="add-menu-btn" title="Options">+</button>
+            <div class="add-menu" id="add-menu"></div>
+          </div>
+          <select id="model-select" class="model-select-mini"></select>
+          <button class="input-feat-btn" id="params-btn" title="Model parameters">&#9881;</button>
+          <div class="input-bottom-spacer"></div>
+          <button id="send-btn">send</button>
+        </div>
+      </div>
+      <div class="input-hint">Enter to send &middot; Shift+Enter for newline &middot; Ctrl+F search &middot; Ctrl+B files</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="page" id="projects-page">
+  <div class="page-topbar">
+    <button class="page-back-btn" id="projects-back-btn" title="Back">&#8592;</button>
+    <h2>Projects</h2>
+    <button class="page-new-btn" id="projects-new-btn">+ New</button>
+  </div>
+  <div class="page-scroll">
+    <div class="projects-grid" id="projects-grid"></div>
+    <div class="projects-empty" id="projects-empty">
+      <h3>No projects yet</h3>
+      <p>Projects group related chats, share instructions, and keep a knowledge base.</p>
+      <button class="page-new-btn" id="projects-empty-new-btn">Create your first project</button>
+    </div>
+  </div>
+</div>
+
+<div class="page" id="detail-page">
+  <div class="page-topbar">
+    <button class="page-back-btn" id="detail-back-btn" title="Back">&#8592;</button>
+    <input type="text" id="detail-title" class="page-title-input" placeholder="Project name" autocomplete="off" spellcheck="false">
+    <button class="page-new-btn" id="detail-open-chat-btn">Open chat</button>
+  </div>
+  <div class="detail-scroll">
+    <div class="detail-section">
+      <h3>Instructions</h3>
+      <textarea id="detail-instructions" class="detail-instructions" placeholder="Optional instructions prepended to the system prompt for chats in this project..."></textarea>
+      <div class="detail-hint">Saved automatically. These instructions guide the model for all chats in this project.</div>
+    </div>
+    <div class="detail-section">
+      <h3>Knowledge base <span class="detail-kb-count" id="detail-kb-count"></span></h3>
+      <div class="kb-files" id="kb-files"></div>
+      <div class="kb-upload">
+        <button class="kb-upload-btn" id="kb-upload-btn">+ Upload files</button>
+        <input type="file" id="kb-file-input" hidden multiple>
+      </div>
+    </div>
+    <div class="detail-section">
+      <h3>Chats</h3>
+      <div id="detail-chats"></div>
+    </div>
+  </div>
+  <div class="detail-input-area">
+    <div class="input-wrap">
+      <div class="input-container">
+        <textarea id="detail-input" rows="1" placeholder="Type a message to start a new chat..."></textarea>
+        <div class="attach-bar" id="detail-attach-bar"></div>
+        <div class="input-bottom">
+          <div class="add-menu-wrap">
+            <button class="input-feat-btn" id="detail-add-menu-btn" title="Options">+</button>
+            <div class="add-menu" id="detail-add-menu"></div>
+          </div>
+          <select id="detail-model-select" class="model-select-mini"></select>
+          <div class="input-bottom-spacer"></div>
+          <button id="detail-send-btn">send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="rename-modal">
+  <div class="modal">
+    <div class="modal-header"><h2>Rename Chat</h2><button class="modal-close" id="rename-close-btn">&times;</button></div>
+    <div class="modal-body">
+      <div class="modal-field">
+        <label>Title</label>
+        <input type="text" id="rename-input" placeholder="Chat title">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-cancel" id="rename-cancel-btn">Cancel</button>
+      <button class="btn-save" id="rename-save-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="dialog-modal">
+  <div class="modal dialog-box">
+    <div class="modal-header"><h2 id="dialog-title">gooey</h2></div>
+    <div class="modal-body"><div class="dialog-message" id="dialog-message"></div></div>
+    <div class="modal-footer">
+      <button class="btn-cancel" id="dialog-cancel-btn">Cancel</button>
+      <button class="btn-save" id="dialog-ok-btn">OK</button>
+    </div>
+  </div>
+</div>
+
+<div class="params-popover" id="params-popover">
+  <label>Temperature <span style="display:flex;gap:8px;align-items:center"><input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7"><span class="param-val" id="param-temp-val">0.7</span></span></label>
+  <label>Top P <span style="display:flex;gap:8px;align-items:center"><input type="range" id="param-topp" min="0" max="1" step="0.05" value="0.9"><span class="param-val" id="param-topp-val">0.9</span></span></label>
+  <label>Max tokens <span style="display:flex;gap:8px;align-items:center"><input type="range" id="param-numpredict" min="32" max="8192" step="32" value="2048"><span class="param-val" id="param-numpredict-val">2048</span></span></label>
+  <label>Context <span style="display:flex;gap:8px;align-items:center"><input type="range" id="param-numctx" min="512" max="65536" step="512" value="2048"><span class="param-val" id="param-numctx-val">2048</span></span></label>
+</div>
+
+<div class="chat-menu" id="chat-menu"></div>
+
+<div class="file-overlay" id="file-overlay"></div>
+<div class="file-panel" id="file-panel">
+  <div class="file-sidebar">
+    <div class="file-sidebar-header">
+      <h3>Sandbox</h3>
+      <div class="file-sidebar-actions">
+        <button class="file-action-btn" id="file-refresh" title="Refresh">&#8635;</button>
+      </div>
+    </div>
+    <div class="file-tree" id="file-tree"></div>
+  </div>
+  <div class="file-editor-area">
+    <div class="file-editor-content" id="file-editor-content"></div>
+    <div class="run-output" id="run-output">
+      <div class="run-output-header">
+        <span class="exit-code" id="run-exit-code"></span>
+        <span class="run-time" id="run-time"></span>
+        <span style="flex:1"></span>
+        <button class="close-run" id="run-close" title="Close">&times;</button>
+      </div>
+      <div class="run-stdout" id="run-stdout"></div>
+      <div class="run-stderr" id="run-stderr"></div>
+      <div class="run-stdin-bar">
+        <input id="run-stdin" placeholder="stdin...">
+        <button id="run-rerun-btn">Run</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="chat-file-input" hidden multiple>
+<script src="app.js"></script>
+</body>
+</html>
