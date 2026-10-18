@@ -24,6 +24,18 @@ Built to run well on low-resource devices (it lives in Termux on an Android tabl
 | `gooey_cli.py` | A Textual terminal client for the same chats |
 | `vendor/` | Locally vendored marked, DOMPurify, highlight.js (so it works offline) |
 
+## Safety disclaimer
+
+This is hobby open-source software by a beginner developer. **Nothing here is guaranteed safe to use.** It has not been professionally audited, penetration-tested, or verified in any way, and there is no warranty of any kind.
+
+Be especially aware that:
+
+- the **code runner executes model-generated code as your own user** — treat it like running any random script you found on the internet
+- the server binds to localhost but has **not been hardened** against hostile local processes or browser-based attacks (DNS rebinding)
+- your chats live in a plain `storage.json` with no encryption
+
+Use at your own risk, read the code yourself, and don't point it at anything you can't afford to lose. Known issues are tracked in the [issue tracker](https://github.com/akivamac/gooey/issues) with the `audit` label.
+
 ## Quick start
 
 Requires Python 3 and a running Ollama instance.
