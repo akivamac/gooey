@@ -8,6 +8,11 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 8000
+# Jetson device for the "jetson" model-dropdown section. The /api/jetson/*
+# proxy only ever forwards to this fixed host (never an open proxy).
+JETSON_HOST = "192.168.8.152"
+JETSON_PORT = 11434
+JETSON_PATHS = ("tags", "chat", "generate")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_FILE = os.path.join(BASE_DIR, "storage.json")
 SANDBOX_ROOT = os.path.join(BASE_DIR, "sandbox")
@@ -623,6 +628,75 @@ class Handler(SimpleHTTPRequestHandler):
         qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
         return qs.get("chatId", [None])[0]
 
+    def _handle_jetson(self, subpath, method, body=None):
+        # Narrow proxy to one hard-coded device so the frontend can reach the
+        # jetson Ollama without browser CORS, and so this cannot be used as an
+        # open proxy (host fixed above, sub-paths whitelisted below).
+        # Connect is kept short so an off device fails fast (~2-3s probe);
+        # once connected, chat I/O gets a long timeout for generation.
+        import http.client
+        if subpath not in JETSON_PATHS:
+            self.send_error(404)
+            return
+        payload = json.dumps(body).encode() if isinstance(body, dict) else None
+        streaming = isinstance(body, dict) and bool(body.get("stream"))
+        connect_timeout = 2.5 if subpath == "tags" else 3.0
+        io_timeout = 4.0 if subpath == "tags" else 600.0
+        conn = http.client.HTTPConnection(JETSON_HOST, JETSON_PORT, timeout=connect_timeout)
+        try:
+            conn.connect()
+            try:
+                if conn.sock is not None:
+                    conn.sock.settimeout(io_timeout)
+            except Exception:
+                pass
+            headers = {"Content-Type": "application/json"} if payload is not None else {}
+            conn.request(method, "/api/" + subpath, body=payload, headers=headers)
+            upstream = conn.getresponse()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._json_response(502, {"ok": False, "error": "no devices on " + JETSON_HOST})
+            return
+        try:
+            status = getattr(upstream, "status", None) or 200
+            if streaming and status == 200:
+                # Pass NDJSON through as it arrives. No Content-Length plus
+                # "Connection: close" means the body ends at connection close.
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self._cors_headers()
+                self.end_headers()
+                reader = getattr(upstream, "read1", None) or upstream.read
+                while True:
+                    chunk = reader(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                return
+            raw = upstream.read()
+            try:
+                parsed = json.loads(raw)
+                self._json_response(status if 100 <= status < 600 else 502, parsed)
+            except Exception:
+                self._json_response(502, {"ok": False, "error": "bad response from " + JETSON_HOST})
+        except Exception:
+            try:
+                self._json_response(502, {"ok": False, "error": "no devices on " + JETSON_HOST})
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def do_GET(self):
         try:
             path_no_query = self.path.split("?")[0]
@@ -642,6 +716,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if not self._check_origin():
                     return
                 self._handle_files_get()
+            elif path_no_query.startswith("/api/jetson/"):
+                if not self._check_origin():
+                    return
+                self._handle_jetson(path_no_query[len("/api/jetson/"):], "GET")
             elif path_no_query in ("/", "/index.html"):
                 self._serve_static("index.html")
             elif path_no_query == "/manifest.json":
@@ -717,7 +795,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path_no_query.startswith("/api"):
                 if not self._check_origin():
                     return
-                if path_no_query == "/api/storage" or path_no_query == "/api/files/run" or path_no_query == "/api/files" or path_no_query.startswith("/api/files/"):
+                if path_no_query == "/api/storage" or path_no_query == "/api/files/run" or path_no_query == "/api/files" or path_no_query.startswith("/api/files/") or path_no_query.startswith("/api/jetson/"):
                     if not self._check_json_content_type():
                         return
             if path_no_query == "/api/storage":
@@ -764,6 +842,14 @@ class Handler(SimpleHTTPRequestHandler):
                     self._handle_files_post(body)
             elif path_no_query == "/api/files" or path_no_query.startswith("/api/files/"):
                 self._handle_files_post()
+            elif path_no_query.startswith("/api/jetson/"):
+                body = self._read_body()
+                if body is None:
+                    return
+                if not isinstance(body, dict):
+                    self._json_response(400, {"error": "expected JSON object"})
+                    return
+                self._handle_jetson(path_no_query[len("/api/jetson/"):], "POST", body)
             else:
                 self.send_error(404)
         except Exception:

@@ -1,6 +1,15 @@
 (function() {
   'use strict';
   const OLLAMA_HOST = localStorage.getItem('gooey_ollama_host') || 'http://127.0.0.1:11434';
+  // Jetson device: models picked from the "jetson" dropdown section are sent
+  // through the server's narrow /api/jetson/* proxy (fixed host, no CORS).
+  const JETSON_ITEM = '__jetson__';
+  const JETSON_PREFIX = 'jetson:';
+  const JETSON_NONE_MSG = 'no devices on 192.168.8.152';
+  let activeModelHost = null; // null = local Ollama; '/api/jetson' when a jetson model is selected
+  let jetsonCache = { at: 0, state: null, models: null }; // state: 'ok' | 'none'
+  let jetsonProbeInFlight = false;
+  let jetsonPendingRestore = null;
   const IMAGE_TYPES = ['image/png','image/jpeg','image/gif','image/webp'];
 
   let projects = JSON.parse(localStorage.getItem('gooey_projects') || '{}');
@@ -455,37 +464,111 @@
   }
 
   // --- Models ---
+  function syncModelSelection() {
+    const sel = document.getElementById('model-select');
+    const v = sel ? sel.value : '';
+    activeModelHost = v.indexOf(JETSON_PREFIX) === 0 ? '/api/jetson' : null;
+  }
+  function syncDetailModelSelect() {
+    const sel = document.getElementById('model-select');
+    const dsel = document.getElementById('detail-model-select');
+    if (!dsel) return;
+    dsel.innerHTML = '';
+    if (!sel || sel.options.length === 0) { dsel.innerHTML = '<option value="">No models</option>'; return; }
+    Array.from(sel.options).forEach(function(o) {
+      const opt = document.createElement('option');
+      opt.value = o.value;
+      opt.textContent = o.textContent;
+      opt.disabled = o.disabled;
+      dsel.appendChild(opt);
+    });
+    dsel.value = sel.value;
+  }
+  function renderJetsonSection() {
+    const sel = document.getElementById('model-select');
+    if (!sel) return;
+    const prev = sel.value;
+    Array.from(sel.options).forEach(function(o) { if (o.dataset && o.dataset.jetson) o.remove(); });
+    const add = function(value, text, cls) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = text;
+      o.dataset.jetson = '1';
+      if (cls) o.className = cls;
+      sel.appendChild(o);
+      return o;
+    };
+    if (jetsonCache.state === 'ok') {
+      add('__jetson_hdr__', 'jetson:', 'jetson-section').disabled = true;
+      jetsonCache.models.forEach(function(n) { add(JETSON_PREFIX + n, n); });
+    } else if (jetsonCache.state === 'none') {
+      add(JETSON_ITEM, JETSON_NONE_MSG, 'jetson-none');
+    } else {
+      add(JETSON_ITEM, 'jetson');
+    }
+    const has = function(v) { return Array.from(sel.options).some(function(o) { return o.value === v; }); };
+    let next = null;
+    if (jetsonPendingRestore && has(jetsonPendingRestore)) next = jetsonPendingRestore;
+    else if (prev && has(prev)) next = prev;
+    else if (prev === JETSON_ITEM && jetsonCache.state === 'ok') next = JETSON_PREFIX + jetsonCache.models[0];
+    else if (prev && prev.indexOf(JETSON_PREFIX) === 0 && sel.options.length) next = sel.options[0].value;
+    if (next) sel.value = next;
+    syncModelSelection();
+    syncDetailModelSelect();
+  }
+  async function probeJetson(force) {
+    if (jetsonProbeInFlight) return;
+    if (!force && jetsonCache.state && (Date.now() - jetsonCache.at) < 10000) return;
+    jetsonProbeInFlight = true;
+    let state = 'none';
+    let models = null;
+    try {
+      const res = await fetch('/api/jetson/tags');
+      const data = await res.json();
+      if (res.ok && data && Array.isArray(data.models) && data.models.length) {
+        const names = data.models.map(function(m) { return m.name; }).filter(Boolean);
+        if (names.length) { state = 'ok'; models = names; }
+      }
+    } catch {}
+    jetsonProbeInFlight = false;
+    jetsonCache = { at: Date.now(), state: state, models: models };
+    renderJetsonSection();
+  }
   async function loadModels() {
     const sel = document.getElementById('model-select');
     const dsel = document.getElementById('detail-model-select');
-    const fillModels = function(target) {
-      if (!target) return;
-      target.innerHTML = '';
-      if (sel.options.length === 0) { target.innerHTML = '<option value="">No models</option>'; return; }
-      Array.from(sel.options).forEach(function(o) {
-        const opt = document.createElement('option');
-        opt.value = o.value;
-        opt.textContent = o.textContent;
-        target.appendChild(opt);
-      });
-      target.value = sel.value;
+    sel.onchange = function() {
+      const v = sel.value;
+      if (v === JETSON_ITEM) { probeJetson(true); return; }
+      if (v.indexOf('__') === 0) return;
+      localStorage.setItem('gooey_model', v);
+      syncModelSelection();
+      syncDetailModelSelect();
     };
+    sel.onmousedown = function() { probeJetson(); };
+    sel.onfocus = function() { probeJetson(); };
+    if (dsel) dsel.onchange = function() { sel.value = dsel.value; if (sel.onchange) sel.onchange(); };
     try {
       const res = await fetch(`${OLLAMA_HOST}/api/tags`);
       const data = await res.json();
       sel.innerHTML = '';
-      if (!data.models || data.models.length === 0) { sel.innerHTML = '<option value="">No models</option>'; if (dsel) fillModels(dsel); return; }
+      if (!data.models || data.models.length === 0) {
+        sel.innerHTML = '<option value="">No models</option>';
+        renderJetsonSection();
+        return;
+      }
       data.models.forEach(m => { const o = document.createElement('option'); o.value = m.name; o.textContent = m.name; sel.appendChild(o); });
       const saved = localStorage.getItem('gooey_model');
-      if (saved && data.models.some(m => m.name === saved)) sel.value = saved;
-      sel.onchange = () => localStorage.setItem('gooey_model', sel.value);
-      if (dsel) {
-        fillModels(dsel);
-        dsel.onchange = () => { sel.value = dsel.value; localStorage.setItem('gooey_model', dsel.value); };
+      if (saved && saved.indexOf(JETSON_PREFIX) === 0) jetsonPendingRestore = saved;
+      else if (saved && data.models.some(m => m.name === saved)) sel.value = saved;
+      renderJetsonSection();
+      if (jetsonPendingRestore) {
+        const clearPending = function() { jetsonPendingRestore = null; };
+        probeJetson(true).then(clearPending, clearPending);
       }
     } catch {
       sel.innerHTML = '<option value="">Cannot reach Ollama</option>';
-      if (dsel) fillModels(dsel);
+      renderJetsonSection();
     }
   }
 
@@ -935,7 +1018,7 @@
     const token = ++titleGenToken;
     showTitleChip();
     try {
-      const res = await fetch(`${OLLAMA_HOST}/api/generate`, {
+      const res = await fetch(`${activeModelHost || OLLAMA_HOST}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, prompt: `Generate a short 3-5 word title for this conversation. Reply with ONLY the title, nothing else.\n\nUser: ${userText}`, stream: false, options: { temperature: 0.3, num_predict: 20 } })
@@ -994,12 +1077,14 @@
     const input = document.getElementById('input');
     const text = (injectText != null ? injectText : input.value).trim();
     if (!text) return;
-    const model = document.getElementById('model-select').value;
-    if (!model) {
+    const rawModel = document.getElementById('model-select').value;
+    if (!rawModel || rawModel.indexOf('__') === 0) {
       if (injectText != null) return;
       showDialog({ title: 'No model', message: 'Select a model first.' });
       return;
     }
+    const model = rawModel.indexOf(JETSON_PREFIX) === 0 ? rawModel.slice(JETSON_PREFIX.length) : rawModel;
+    syncModelSelection();
 
     const useTarget = !!(opts && opts.chatId);
     const showInDom = !useTarget || targetChatId === streamChatId;
@@ -1207,7 +1292,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     }
 
     try {
-      const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+      const res = await fetch(`${activeModelHost || OLLAMA_HOST}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages: apiMessages, stream: true, options: getParams() }),
@@ -1723,7 +1808,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     };
     const to = withTimeout(120000);
     try {
-      const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+      const res = await fetch(`${activeModelHost || OLLAMA_HOST}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages: [sysMsg, ...buf], stream: false, options: { num_ctx: ctxV, temperature: 0.2, num_predict: Math.max(120, Math.min(600, maxSummaryTokens || 600)) } }),
