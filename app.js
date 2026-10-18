@@ -210,6 +210,7 @@
     });
     cids.forEach(cid => endStreamState(cid, cid === activeChatId));
     try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+    cancelTitleGen();
   }
   function performFileOp(op, chatId) {
     const cid = chatId || activeChatId;
@@ -820,7 +821,7 @@
   function showDialog(opts) {
     if (dialogOpen) { dialogQueue.push(opts); return; }
     dialogOpen = true;
-    document.getElementById('dialog-title').textContent = opts.title || 'gooey';
+    document.getElementById('dialog-title').textContent = opts.title || 'Gooey';
     document.getElementById('dialog-message').textContent = opts.message || '';
     const ok = document.getElementById('dialog-ok-btn');
     const cancel = document.getElementById('dialog-cancel-btn');
@@ -857,7 +858,7 @@
       title.textContent = projects[activeProjectId].name;
     } else {
       btn.style.display = 'none';
-      title.textContent = 'gooey';
+      title.textContent = 'Gooey';
     }
   }
 
@@ -930,11 +931,11 @@
       const projMsg = activeProjectId && projects[activeProjectId]
         ? `<p>Start a new chat in <strong>${esc(projects[activeProjectId].name)}</strong></p>`
         : `<p>Local LLM chat powered by Ollama. Pick a model and start chatting, or create a project.</p>`;
-      inner.innerHTML = `<div class="welcome"><h2>gooey</h2>${projMsg}</div>`;
+      inner.innerHTML = `<div class="welcome"><h2>Gooey</h2>${projMsg}</div>`;
       return;
     }
     const msgs = conversations[activeChatId].messages;
-    if (msgs.length === 0) { inner.innerHTML = '<div class="welcome"><h2>gooey</h2><p>Ask me anything.</p></div>'; return; }
+    if (msgs.length === 0) { inner.innerHTML = '<div class="welcome"><h2>Gooey</h2><p>Ask me anything.</p></div>'; return; }
     inner.innerHTML = '';
     msgs.forEach((m, i) => {
       if (m.injected) return;
@@ -997,6 +998,23 @@
   // --- Title generation ---
   let titleChip = null;
   let titleGenToken = 0;
+  let titleGenAbort = null;
+  let titleGenConv = null;
+  function cancelTitleGen() {
+    if (titleGenAbort) { try { titleGenAbort.abort(); } catch {} }
+    titleGenAbort = null;
+    if (titleGenConv && conversations[titleGenConv] && !conversations[titleGenConv].titleLocked) conversations[titleGenConv].titlePending = true;
+    titleGenConv = null;
+    titleGenToken++;
+    hideTitleChip();
+  }
+  function maybeNameAfterStream(cid) {
+    const conv = conversations[cid];
+    if (!conv || !conv.titlePending || conv.titleLocked) return;
+    if (isChatStreaming(cid)) return;
+    if (document.getElementById('gooey-loading')) return; // never overlap the gooer
+    generateTitle(conv, conv.model);
+  }
   function showTitleChip() {
     if (titleChip && titleChip.isConnected) return;
     titleChip = null;
@@ -1012,16 +1030,21 @@
 
   async function generateTitle(conv, model) {
     if (conv.titleLocked) return;
+    conv.titlePending = false;
     const firstUser = conv.messages.find(m => m.role === 'user' && !m.injected);
     if (!firstUser) return;
     const userText = firstUser.content.slice(0, 1500);
     const token = ++titleGenToken;
+    const ac = new AbortController();
+    titleGenAbort = ac;
+    titleGenConv = conv.id;
     showTitleChip();
     try {
       const res = await fetch(`${activeModelHost || OLLAMA_HOST}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, prompt: `Generate a short 3-5 word title for this conversation. Reply with ONLY the title, nothing else.\n\nUser: ${userText}`, stream: false, options: { temperature: 0.3, num_predict: 20 } })
+        body: JSON.stringify({ model, prompt: `Generate a short 3-5 word title for this conversation. Reply with ONLY the title, nothing else.\n\nUser: ${userText}`, stream: false, options: { temperature: 0.3, num_predict: 20 } }),
+        signal: ac.signal
       });
       const data = await res.json();
       if (data.response) {
@@ -1031,8 +1054,11 @@
           renderSidebar();
         }
       }
-    } catch {}
+    } catch (e) {
+      if (e && e.name === 'AbortError' && !conv.titleLocked) conv.titlePending = true;
+    }
     if (token === titleGenToken) hideTitleChip();
+    if (titleGenAbort === ac) { titleGenAbort = null; titleGenConv = null; }
   }
 
   // --- Send / Stop ---
@@ -1069,6 +1095,7 @@
         bumpResumeToken(targetChatId);
         endStreamState(targetChatId, true);
         try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+        cancelTitleGen();
         return;
       } else {
         return;
@@ -1112,6 +1139,7 @@
 
     // Mark this chat as streaming synchronously to prevent double-send into it
     streamingChats[targetChatId] = true;
+    cancelTitleGen(); // never show the gooer and the naming indicator together
 
     let userContent = text;
     const images = [];
@@ -1133,10 +1161,11 @@
     }
     if (showInDom) renderChat();
 
-    // Fire title gen in parallel (don't await)
+    // Defer title gen until the response completes (never overlap the gooer);
+    // the pending flag ensures the chat still gets named later.
     if (!useTarget) {
       const isFirst = conv.messages.filter(m => m.role === 'user' && !m.injected).length === 1;
-      if (isFirst) generateTitle(conv, model);
+      if (isFirst) conv.titlePending = true;
     }
 
     if (injectText == null) {
@@ -1197,6 +1226,7 @@
     abortControllers[targetChatId] = ac;
     let timedOut = false;
     let abortExited = false;
+    let userAborted = false;
     const apiTimeout = setTimeout(() => { timedOut = true; ac.abort(); }, 180000);
 
     const apiMessages = [];
@@ -1518,6 +1548,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       if (activeChatId === streamChatId) renderChat();
     } catch (e) {
       if (e.name === 'AbortError') {
+        userAborted = true;
         const lastMsg = conv.messages[conv.messages.length - 1];
         if (conv.messages[myMsgIdx] === lastMsg && lastMsg && lastMsg.role === 'assistant') {
           const loader = document.getElementById('gooey-loading');
@@ -1563,6 +1594,9 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       if (resumeToken(targetChatId) === entryToken) {
         endStreamState(targetChatId, showInDom);
       }
+      // If naming was pending/interrupted (e.g. user pressed stop), name the chat
+      // at the next completed response — but not right after an abort.
+      if (!userAborted) maybeNameAfterStream(targetChatId);
     }
   }
 

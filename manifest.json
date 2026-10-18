@@ -1,6 +1,6 @@
 {
-  "name": "gooey",
-  "short_name": "gooey",
+  "name": "Gooey",
+  "short_name": "Gooey",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
