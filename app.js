@@ -7,18 +7,36 @@
   let conversations = JSON.parse(localStorage.getItem('gooey_conversations') || '{}');
   let activeProjectId = null;
   let activeChatId = null;
-  let streaming = false;
-  let abortController = null;
   let chatAttachments = [];
   let saveTimeout = null;
   let storageRevision = 0;
+  let abortControllers = {};
+  let streamingChats = {};
+  let resumeTokens = {};
+  function bumpResumeToken(cid) { resumeTokens[cid] = (resumeTokens[cid] || 0) + 1; return resumeTokens[cid]; }
+  function resumeToken(cid) { return resumeTokens[cid] || 0; }
+  function isChatStreaming(cid) { return !!(cid && streamingChats[cid]); }
+  function endStreamState(cid, showInDom) {
+    delete streamingChats[cid];
+    delete abortControllers[cid];
+    if (showInDom && typeof setStreamingUI === 'function') setStreamingUI(false);
+  }
 
   // --- Marked setup ---
   marked.setOptions({ breaks: true });
   const renderer = new marked.Renderer();
-  renderer.code = function(codeText, infostring) {
-    const t = String(codeText || '');
-    const lang = String(infostring || '').trim();
+  renderer.code = function(codeOrToken, infostring) {
+    let t, lang;
+    if (codeOrToken && typeof codeOrToken === 'object') {
+      // marked >= v5+ token-object API
+      t = codeOrToken.text != null ? codeOrToken.text : (codeOrToken.code || '');
+      lang = codeOrToken.lang != null ? codeOrToken.lang : '';
+    } else {
+      t = codeOrToken || '';
+      lang = infostring || '';
+    }
+    t = String(t || '');
+    lang = String(lang || '').trim();
     const langLabel = lang || 'text';
     // Bounded highlighting: huge or unclosed-fence code blocks (mid-stream) would hang the tab
     let highlighted;
@@ -175,7 +193,14 @@
     return urls.length ? '\n\nSources: ' + urls.join(', ') : '';
   }
   function abortIfStreaming() {
-    if (streaming) { if (abortController) abortController.abort(); }
+    const cids = Object.keys(streamingChats);
+    cids.forEach(cid => {
+      bumpResumeToken(cid);
+      const ac = abortControllers[cid];
+      if (ac) ac.abort();
+    });
+    cids.forEach(cid => endStreamState(cid, cid === activeChatId));
+    try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
   }
   function performFileOp(op, chatId) {
     const cid = chatId || activeChatId;
@@ -221,7 +246,7 @@
       })();
     } else if (op.type === 'append_file') {
       return (async () => {
-        const res = await fetch('/api/files/' + encodeURIComponent(op.path), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chatId: cid, append: true, content: op.content || '' }) });
+        const res = await fetch('/api/files', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chatId: cid, path: op.path, append: true, content: op.content || '' }) });
         const data = await res.json().catch(() => ({}));
         if (data.error) return data.error;
         refreshFileTree();
@@ -250,9 +275,9 @@
   // --- Persistence (file-backed) ---
   let saveChain = Promise.resolve();
   function fetchPost(data) {
-    return fetch('/api/storage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: data }).then(function(res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res;
+    return fetch('/api/storage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: data }).then(async function(res) {
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
     });
   }
   function sanitizeContentForStorage(content) {
@@ -268,6 +293,7 @@
         const copy = Object.assign({}, m);
         if (copy.content) copy.content = sanitizeContentForStorage(copy.content);
         if (copy.lastTool && copy.lastTool.content) copy.lastTool.content = sanitizeContentForStorage(copy.lastTool.content);
+        delete copy.images;
         return copy;
       });
       convSnap[cid] = Object.assign({}, conv, { messages });
@@ -278,14 +304,37 @@
     try {
       localStorage.setItem('gooey_projects', JSON.stringify(snap.projects || {}));
       localStorage.setItem('gooey_conversations', JSON.stringify(snap.conversations || {}));
-      localStorage.setItem('gooey_revision', String(snap.revision || storageRevision));
+      localStorage.setItem('gooey_revision', String(storageRevision));
     } catch {}
   }
   function save() {
     storageRevision += 1;
     const snap = snapshotForPersistence();
-    const data = JSON.stringify({ revision: storageRevision, projects: snap.projects, conversations: snap.conversations });
-    saveChain = saveChain.then(() => fetchPost(data)).catch(() => localFallback(snap));
+    saveChain = saveChain.then(async () => {
+      const data = JSON.stringify({ revision: storageRevision, projects: snap.projects, conversations: snap.conversations });
+      const r = await fetchPost(data);
+      if (r.ok) {
+        if (typeof r.body.revision === 'number') storageRevision = r.body.revision;
+        return;
+      }
+      if (r.status === 409) {
+        // Conflict: rebased against server's revision and retry once
+        try {
+          const res = await fetch('/api/storage');
+          const srv = await res.json();
+          if (srv && typeof srv.revision === 'number') storageRevision = srv.revision;
+        } catch {}
+        storageRevision += 1;
+        const retrySnap = snapshotForPersistence();
+        const retryData = JSON.stringify({ revision: storageRevision, projects: retrySnap.projects, conversations: retrySnap.conversations });
+        const r2 = await fetchPost(retryData);
+        if (r2.ok) {
+          if (typeof r2.body.revision === 'number') storageRevision = r2.body.revision;
+          return;
+        }
+      }
+      throw new Error('HTTP ' + r.status);
+    }).catch(() => localFallback(snap));
     return saveChain;
   }
 
@@ -296,8 +345,9 @@
       localStorage.setItem('gooey_projects', JSON.stringify(snap.projects));
       localStorage.setItem('gooey_conversations', JSON.stringify(snap.conversations));
       localStorage.setItem('gooey_revision', String(storageRevision));
-      if (typeof snap.revision === 'number') localStorage.setItem('gooey_revision', String(snap.revision));
-    } catch {}
+    } catch (e) {
+      try { console.error('Failed to flush to localStorage', e); } catch {}
+    }
   }
   window.addEventListener('pagehide', flushToLocal);
   window.addEventListener('beforeunload', flushToLocal);
@@ -312,6 +362,12 @@
       if (lr !== null) localRevision = parseInt(lr, 10);
       if (localRevision !== null && isNaN(localRevision)) localRevision = null;
     } catch {}
+    let localSnap = null;
+    try {
+      const p = localStorage.getItem('gooey_projects');
+      const c = localStorage.getItem('gooey_conversations');
+      if (p || c) localSnap = { projects: p ? JSON.parse(p) : {}, conversations: c ? JSON.parse(c) : {} };
+    } catch {}
     let useServer = false;
     try {
       const res = await fetch('/api/storage');
@@ -321,16 +377,26 @@
         useServer = true;
         if (data.projects) projects = data.projects;
         if (data.conversations) conversations = data.conversations;
-        storageRevision = serverRev;
+        storageRevision = Math.max(serverRev, localRevision !== null ? localRevision : 0);
+        // Merge in projects/chats that exist ONLY locally — created (or changed) while
+        // the server was down — instead of silently dropping them when the server returns (#70)
+        if (localSnap) {
+          Object.keys(localSnap.projects || {}).forEach(pid => {
+            if (!projects[pid] && localSnap.projects[pid]) projects[pid] = localSnap.projects[pid];
+          });
+          Object.keys(localSnap.conversations || {}).forEach(cid => {
+            if (!conversations[cid] && localSnap.conversations[cid]) conversations[cid] = localSnap.conversations[cid];
+          });
+        }
       }
     } catch {}
     if (!useServer) {
       // Fallback to localStorage
       try {
-        const p = localStorage.getItem('gooey_projects');
-        const c = localStorage.getItem('gooey_conversations');
-        if (p) projects = JSON.parse(p);
-        if (c) conversations = JSON.parse(c);
+        if (localSnap) {
+          if (localSnap.projects) projects = localSnap.projects;
+          if (localSnap.conversations) conversations = localSnap.conversations;
+        }
         storageRevision = localRevision !== null ? localRevision : 0;
       } catch {}
     }
@@ -353,9 +419,27 @@
     activeChatId = null;
     viewingProjectId = null;
     chatAttachments = [];
-    try { await fetch('/api/storage', { method: 'DELETE' }); } catch {}
+    try {
+      const del = await fetch('/api/storage', { method: 'DELETE' });
+      if (!del.ok) throw new Error('HTTP ' + del.status);
+    } catch (e) {
+      showDialog({ title: 'Clear failed', message: e.message || 'Failed to clear server storage' });
+      return;
+    }
     storageRevision += 1;
-    saveChain = saveChain.then(() => fetchPost(JSON.stringify({ projects: {}, conversations: {}, revision: storageRevision }))).catch(() => {});
+    try {
+      const snap = snapshotForPersistence();
+      const data = JSON.stringify({ revision: storageRevision, projects: snap.projects, conversations: snap.conversations });
+      saveChain = saveChain.then(async () => {
+        const r = await fetchPost(data);
+        if (r.status === 409) {
+          try {
+            const srv = await (await fetch('/api/storage')).json();
+            if (srv && typeof srv.revision === 'number') storageRevision = srv.revision;
+          } catch {}
+        }
+      }).catch(() => {});
+    } catch {}
     try {
       Object.keys(localStorage).filter(k => k.startsWith('gooey_')).forEach(k => localStorage.removeItem(k));
     } catch {}
@@ -375,6 +459,7 @@
     const sel = document.getElementById('model-select');
     const dsel = document.getElementById('detail-model-select');
     const fillModels = function(target) {
+      if (!target) return;
       target.innerHTML = '';
       if (sel.options.length === 0) { target.innerHTML = '<option value="">No models</option>'; return; }
       Array.from(sel.options).forEach(function(o) {
@@ -679,14 +764,7 @@
     document.getElementById('sidebar-overlay').classList.remove('open');
   }
 
-  function selectProject(pid) {
-    activeProjectId = pid;
-    const projChats = Object.keys(conversations).filter(cid => conversations[cid].projectId === pid).sort((a, b) => chatIdNum(b) - chatIdNum(a));
-    activeChatId = projChats[0] || null;
-    renderSidebar();
-    renderChat();
-    updateTopbar();
-  }
+
 
   function updateTopbar() {
     const btn = document.getElementById('project-settings-btn');
@@ -702,22 +780,27 @@
 
   // --- Chat ---
   function newChat(projectId) {
-    if (streaming) abortIfStreaming();
     const pid = projectId || activeProjectId;
     const id = Date.now().toString() + Math.random().toString(36).slice(2, 6);
     conversations[id] = { id, title: 'New chat', messages: [], model: document.getElementById('model-select').value, projectId: pid || null };
     activeChatId = id;
     if (pid) activeProjectId = pid;
+    chatAttachments = [];
+    renderAttachBar();
+    setStreamingUI(false);
     save();
     renderSidebar();
     renderChat();
     updateTopbar();
+    closeMobileSidebar();
   }
 
   function switchChat(id) {
-    if (streaming) abortIfStreaming();
     activeChatId = id;
     lastRunPath = null;
+    chatAttachments = [];
+    renderAttachBar();
+    setStreamingUI(isChatStreaming(id));
     if (conversations[id]?.projectId) activeProjectId = conversations[id].projectId;
     else if (conversations[id]) activeProjectId = null;
     renderSidebar();
@@ -884,28 +967,30 @@
   }
 
   function handleSendOrStop() {
-    if (streaming) {
-      if (abortController) abortController.abort();
+    if (isChatStreaming(activeChatId)) {
+      const ac = abortControllers[activeChatId];
+      if (ac) ac.abort();
     } else {
       send();
     }
   }
 
   async function send(injectText, opts) {
-    if (streaming) {
+    let streamChatId = activeChatId;
+    let targetChatId = (opts && opts.chatId) || streamChatId;
+    if (isChatStreaming(targetChatId)) {
       if (injectText == null) {
-        if (abortController) abortController.abort();
-        ++searchResumeToken;
-        streaming = false;
-        abortController = null;
-        if (typeof setStreamingUI === 'function') setStreamingUI(false);
+        // Stop semantics for this chat: abort and invalidate any pending resume
+        const sac = abortControllers[targetChatId];
+        if (sac) sac.abort();
+        bumpResumeToken(targetChatId);
+        endStreamState(targetChatId, true);
+        try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+        return;
       } else {
         return;
       }
     }
-    const entryToken = searchResumeToken;
-    const streamChatId = activeChatId;
-    const targetChatId = (opts && opts.chatId) || streamChatId;
     const input = document.getElementById('input');
     const text = (injectText != null ? injectText : input.value).trim();
     if (!text) return;
@@ -922,11 +1007,14 @@
     let conv;
     if (useTarget) {
       conv = conversations[targetChatId];
-      if (!conv) { streaming = false; return; }
+      if (!conv) return;
     } else {
       if (!activeChatId || !conversations[activeChatId]) newChat();
+      streamChatId = activeChatId;
+      targetChatId = activeChatId;
       conv = conversations[activeChatId];
     }
+    const entryToken = resumeToken(targetChatId);
 
     // Drop a dangling, aborted assistant message (no content, no pending ops) left by a previous send
     if (injectText == null && conv.messages.length) {
@@ -937,8 +1025,8 @@
       }
     }
 
-    // Set streaming synchronously to prevent double-send
-    streaming = true;
+    // Mark this chat as streaming synchronously to prevent double-send into it
+    streamingChats[targetChatId] = true;
 
     let userContent = text;
     const images = [];
@@ -950,7 +1038,8 @@
       });
       userContent = text + attachCtx;
     }
-    conv.messages.push({ role: 'user', content: userContent, images: images.length > 0 ? images : undefined, ts: Date.now(), injected: (opts && opts.injected) || undefined });
+    const userMsg = { role: 'user', content: userContent, images: images.length > 0 ? images.slice() : undefined, ts: Date.now(), injected: (opts && opts.injected) || undefined };
+    conv.messages.push(userMsg);
     if (!useTarget) {
       conv.model = model;
       if (!conv.title || conv.title === 'New chat') conv.title = text.slice(0, 40) || 'New chat';
@@ -1019,10 +1108,11 @@
       }, 40);
     }
 
-    abortController = new AbortController();
+    let ac = new AbortController();
+    abortControllers[targetChatId] = ac;
     let timedOut = false;
     let abortExited = false;
-    const apiTimeout = setTimeout(() => { timedOut = true; abortController.abort(); }, 180000);
+    const apiTimeout = setTimeout(() => { timedOut = true; ac.abort(); }, 180000);
 
     const apiMessages = [];
     const sandboxPrompt = `You are a helpful local assistant. For ordinary chat, greetings, and questions you can already answer, reply normally — the sandbox tools below are optional extras, and you should never discuss or apologize for them unless the user asks. Keep answers clear and direct.\nPersonal style: be concise and warm with a sense of humor — catch jokes (accidental or not) and play along. Always be friendly, complimentary, and nice, but stay straight with the user — say what you really think instead of sugarcoating. Make small decisions yourself; check with the user before big ones. Trust the user but push back when something looks wrong; when unsure, search (info file, chats, or web) before guessing.\n\nEXTRA INFO FILE: the user keeps knowledge you don't have in the file extra-info.md. Whenever a question relates to that knowledge, read it without any approval — results are injected automatically: everything in extra-info.md describes the person you are talking to right now (their name, age, device, projects). When the user asks about "my name/age/etc.", those facts ARE about them — never treat the file's person as a third party, never withhold or refuse well-known stored facts, and never act like the user isn't the person the file describes.
@@ -1053,10 +1143,13 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     conv.messages.slice(0, -1).forEach(m => {
       if (m.role === 'user' || m.role === 'assistant') {
         const msg = { role: m.role, content: m.content };
-        if (m.images && m.images.length > 0) msg.images = m.images;
         apiMessages.push(msg);
       }
     });
+    const lastMsgForApi = apiMessages.length ? apiMessages[apiMessages.length - 1] : null;
+    if (lastMsgForApi && lastMsgForApi.role === 'user' && userMsg.images && userMsg.images.length) {
+      lastMsgForApi.images = userMsg.images.slice();
+    }
 
     // Compact oldest messages (AI-powered) to fit context — budget measured in TOKENS (~4 chars/token), scaled to num_ctx
     const ctxN = parseInt(document.getElementById('param-numctx').value) || 2048;
@@ -1105,9 +1198,11 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       const pq = detectPersonalQuery(text);
       if (pq) {
         try {
-          const infoStr = await fetchInfoForInject(pq);
+          const infoStr = await fetchInfoForInject(pq, ac.signal);
           if (infoStr) apiMessages.push({ role: 'user', content: infoStr });
-        } catch {}
+        } catch (e) {
+          if (e && e.name === 'AbortError') throw e;
+        }
       }
     }
 
@@ -1116,7 +1211,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages: apiMessages, stream: true, options: getParams() }),
-        signal: abortController.signal
+        signal: ac.signal
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
@@ -1162,16 +1257,14 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
               // Pause: abort stream, persist ops for re-action, keep history tag-free
               clearTimeout(apiTimeout);
               if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
-              abortController.abort();
+              ac.abort();
               const lastMsgSl = conv.messages[myMsgIdx];
               lastMsgSl.fileOps = completeOps.map(op => ({ type: op.type, path: op.path, content: op.content, old: op.old, new: op.new, preview: (op.content || '').slice(0, 300), status: 'pending' }));
               lastMsgSl.resumePending = true;
               lastMsgSl.content = stripToolTags(stripFileOpsFromContent(fullContent));
               updateContent(lastMsgSl.content);
               save();
-              setStreamingUI(false);
-              streaming = false;
-              abortController = null;
+              endStreamState(targetChatId, showInDom);
               if (showInDom) {
                 const pausedRow = chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]');
                 if (pausedRow) renderStoredFileOps(lastMsgSl, pausedRow);
@@ -1183,16 +1276,14 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
             if (searchTags.length > 0) {
               clearTimeout(apiTimeout);
               if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
-              abortController.abort();
+              ac.abort();
               const cleanContent = stripToolTags(fullContent);
               conv.messages[myMsgIdx].content = cleanContent;
               updateContent(cleanContent);
               const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
-              const token = ++searchResumeToken;
+              const token = bumpResumeToken(targetChatId);
               save();
-              setStreamingUI(false);
-              streaming = false;
-              abortController = null;
+              endStreamState(targetChatId, showInDom);
               void runSearchAndResume(searchTags, lastRow, streamChatId, token);
               return; // Exit send() — runSearchAndResume resumes the stream
             }
@@ -1201,17 +1292,15 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
             if (infoTags.length > 0) {
               clearTimeout(apiTimeout);
               if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
-              abortController.abort();
+              ac.abort();
               const itag = infoTags[infoTags.length - 1];
               const cleanInfo = stripToolTags(fullContent);
               conv.messages[myMsgIdx].content = cleanInfo;
               updateContent(cleanInfo);
               const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
-              const token = ++searchResumeToken;
+              const token = bumpResumeToken(targetChatId);
               save();
-              setStreamingUI(false);
-              streaming = false;
-              abortController = null;
+              endStreamState(targetChatId, showInDom);
               void runInfoAndResume(itag, lastRow, streamChatId, token);
               return; // Exit send() — runInfoAndResume resumes the stream
             }
@@ -1220,17 +1309,15 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
             if (chatSearchTags.length > 0) {
               clearTimeout(apiTimeout);
               if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
-              abortController.abort();
+              ac.abort();
               const chatQuery = chatSearchTags[chatSearchTags.length - 1];
               const cleanChat = stripToolTags(fullContent);
               conv.messages[myMsgIdx].content = cleanChat;
               updateContent(cleanChat);
               const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
-              const token = ++searchResumeToken;
+              const token = bumpResumeToken(targetChatId);
               save();
-              setStreamingUI(false);
-              streaming = false;
-              abortController = null;
+              endStreamState(targetChatId, showInDom);
               void runChatSearchAndResume(chatQuery, lastRow, streamChatId, token);
               return; // Exit send() — runChatSearchAndResume resumes the stream
             }
@@ -1293,10 +1380,8 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
           if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
           save();
-          setStreamingUI(false);
-          streaming = false;
-          abortController = null;
-          const token = ++searchResumeToken;
+          endStreamState(targetChatId, showInDom);
+          const token = bumpResumeToken(targetChatId);
           void runSearchAndResume(leftoverSearch, lastRow, streamChatId, token);
           return;
         }
@@ -1305,10 +1390,8 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
           if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
           save();
-          setStreamingUI(false);
-          streaming = false;
-          abortController = null;
-          const token = ++searchResumeToken;
+          endStreamState(targetChatId, showInDom);
+          const token = bumpResumeToken(targetChatId);
           void runInfoAndResume(itag, lastRow, streamChatId, token);
           return;
         }
@@ -1317,10 +1400,8 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
           if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
           save();
-          setStreamingUI(false);
-          streaming = false;
-          abortController = null;
-          const token = ++searchResumeToken;
+          endStreamState(targetChatId, showInDom);
+          const token = bumpResumeToken(targetChatId);
           void runChatSearchAndResume(chatQuery, lastRow, streamChatId, token);
           return;
         }
@@ -1333,10 +1414,8 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           const lastRow = showInDom ? chatInner.querySelector('.message-assistant[data-msg-idx="' + myMsgIdx + '"]') : null;
           if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
           save();
-          setStreamingUI(false);
-          streaming = false;
-          abortController = null;
-          const token = ++searchResumeToken;
+          endStreamState(targetChatId, showInDom);
+          const token = bumpResumeToken(targetChatId);
           if (p.kind === 'chat') void runChatSearchAndResume(p.query, lastRow, streamChatId, token);
           else void runInfoAndResume({ kind: p.kind, query: p.query }, lastRow, streamChatId, token);
           return;
@@ -1384,7 +1463,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         }
       } else {
         const errMsg = e.message || 'failed to reach Ollama';
-        const lastErrMsg = conv.messages[conv.messages.length - 1];
+        const lastErrMsg = conv.messages[myMsgIdx] || conv.messages[conv.messages.length - 1];
         const ldrErr = document.getElementById('gooey-loading');
         if (ldrErr) ldrErr.remove();
         if (lastErrMsg) {
@@ -1396,10 +1475,8 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     } finally {
       clearTimeout(apiTimeout);
       if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
-      if (searchResumeToken === entryToken) {
-        streaming = false;
-        setStreamingUI(false);
-        abortController = null;
+      if (resumeToken(targetChatId) === entryToken) {
+        endStreamState(targetChatId, showInDom);
       }
     }
   }
@@ -1477,11 +1554,11 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         if (data && data.value) throw new Error(data.value);
         if (data && data.notFound) {
           if (statusEl) { statusEl.textContent = 'File not found: ' + op.path; statusEl.className = 'file-op-status error'; }
-          return;
+          return 'File not found: ' + op.path;
         }
         if (statusEl) { statusEl.textContent = `Read (${data.size || 0} bytes)`; statusEl.className = 'file-op-status done'; }
         refreshFileTree();
-        return;
+        return null;
       }
       const err = await performFileOp(op);
       if (err) throw new Error(err);
@@ -1490,8 +1567,10 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       } else if (op.type === 'delete_file') {
         if (statusEl) { statusEl.textContent = 'Deleted'; statusEl.className = 'file-op-status done'; }
       } else if (statusEl) { statusEl.textContent = 'Saved'; statusEl.className = 'file-op-status done'; }
+      return null;
     } catch (e) {
       if (statusEl) { statusEl.textContent = `Error: ${e.message}`; statusEl.className = 'file-op-status error'; }
+      return e.message || 'failed';
     }
   }
 
@@ -1504,33 +1583,53 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       const row = card.closest('.message-assistant');
       const content = row?.querySelector('.content');
       if (!content) return;
-      const storedMsg = row && conversations[activeChatId] && conversations[activeChatId].messages ? conversations[activeChatId].messages[Number(row.dataset.msgIdx)] : null;
+      const convNow = activeChatId ? conversations[activeChatId] : null;
+      const msgIdx = row ? Number(row.dataset.msgIdx) : NaN;
+      const storedMsg = row && convNow && convNow.messages ? convNow.messages[msgIdx] : null;
       const raw = content.dataset.rawContent || (typeof content.rawContent === 'string' ? content.rawContent : (storedMsg && storedMsg.content ? storedMsg.content : ''));
       const ops = parseFileOps(raw || content.textContent);
       if (ops[idx]) {
         ops[idx]._idx = idx;
-        executeFileOpWithUI(ops[idx], card);
         if (storedMsg && !storedMsg.fileOps) {
           storedMsg.content = cleanToolLeftovers(storedMsg.content || '');
-          storedMsg.fileOps = [];
-          ops.forEach((o, i) => { storedMsg.fileOps.push({ type: o.type, path: o.path, content: o.content, old: o.old, new: o.new, preview: (o.content || '').slice(0, 300), status: i === idx ? 'applied' : 'pending' }); });
+          storedMsg.fileOps = ops.map(o => ({ type: o.type, path: o.path, content: o.content, old: o.old, new: o.new, preview: (o.content || '').slice(0, 300), status: 'pending' }));
           storedMsg.resumePending = true;
           save();
-        } else if (storedMsg && storedMsg.fileOps && storedMsg.fileOps[idx]) {
-          storedMsg.fileOps[idx].status = 'applied';
-          save();
         }
+        const storedOp = storedMsg && storedMsg.fileOps ? storedMsg.fileOps[idx] : null;
         approveBtn.disabled = true;
         approveBtn.closest('.file-op-actions').querySelector('[data-reject]').disabled = true;
+        // Persist the REAL outcome from the awaited result, then resume the model (#81)
+        executeFileOpWithUI(ops[idx], card).then(function(errMsg) {
+          if (storedOp) {
+            storedOp.status = errMsg ? 'error' : 'applied';
+            if (errMsg) storedOp.errMessage = errMsg;
+          }
+          save();
+          maybeResume(convNow, msgIdx);
+        });
       }
       return;
     }
     const rejectBtn = e.target.closest('[data-reject]');
     if (rejectBtn) {
+      const cardR = rejectBtn.closest('.file-op-card');
+      const rowR = cardR ? cardR.closest('.message-assistant') : null;
+      const convR = activeChatId ? conversations[activeChatId] : null;
+      const msgIdxR = rowR ? Number(rowR.dataset.msgIdx) : NaN;
+      const msgR = convR && convR.messages ? convR.messages[msgIdxR] : null;
+      const idxR = Number(rejectBtn.dataset.reject);
       rejectBtn.disabled = true;
-      rejectBtn.closest('.file-op-actions').querySelector('[data-approve]').disabled = true;
-      const statusEl = rejectBtn.closest('.file-op-card').querySelector('.file-op-status');
-      if (statusEl) { statusEl.textContent = 'Skipped'; statusEl.className = 'file-op-status'; }
+      const apprBtn = rejectBtn.closest('.file-op-actions').querySelector('[data-approve]');
+      if (apprBtn) apprBtn.disabled = true;
+      const statusElR = cardR ? cardR.querySelector('.file-op-status') : null;
+      if (statusElR) { statusElR.textContent = 'Skipped'; statusElR.className = 'file-op-status'; }
+      // Persist the skip and resume the model instead of only touching the DOM (#81)
+      if (msgR && msgR.fileOps && msgR.fileOps[idxR] && (msgR.fileOps[idxR].status || 'pending') === 'pending') {
+        msgR.fileOps[idxR].status = 'skipped';
+        save();
+        maybeResume(convR, msgIdxR);
+      }
       return;
     }
   });
@@ -1622,11 +1721,23 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       role: 'system',
       content: 'Summarize the ENTIRE conversation exchange below into a comprehensive summary. Preserve: file paths and filenames, code created/edited, decisions, requests in progress, and any details the user may reference later. Output a structured, readable summary of everything covered — not just the last messages. Be thorough but concise.' + contextNote
     };
-    const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [sysMsg, ...buf], stream: false, options: { num_ctx: ctxV, temperature: 0.2, num_predict: Math.max(120, Math.min(600, maxSummaryTokens || 600)) } })
-    });
+    const to = withTimeout(120000);
+    try {
+      const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: [sysMsg, ...buf], stream: false, options: { num_ctx: ctxV, temperature: 0.2, num_predict: Math.max(120, Math.min(600, maxSummaryTokens || 600)) } }),
+        signal: to.signal
+      });
+      if (!res.ok) throw new Error('compaction failed');
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      const text = (data.message?.content || '').trim();
+      if (!text) throw new Error('empty summary');
+      return text;
+    } finally {
+      to.cancel();
+    }
     if (!res.ok) throw new Error('compaction failed');
     const data = await res.json();
     if (data.error) throw new Error(data.error);
@@ -1970,26 +2081,51 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
 
   // --- Regenerate last response ---
   function regenerateLast() {
-    if (streaming || !activeChatId) return;
+    if (isChatStreaming(activeChatId) || !activeChatId) return;
     const conv = conversations[activeChatId];
     // Find last user message, strip everything after it
+    let lastUserIdx = -1;
     for (let i = conv.messages.length - 1; i >= 0; i--) {
       const mm = conv.messages[i];
       if (mm.role === 'user' && !mm.injected) {
+        lastUserIdx = i;
         conv.messages.length = i + 1;
         break;
       }
     }
-    const lastUser = conv.messages[conv.messages.length - 1];
+    if (lastUserIdx < 0) return;
+    const lastUser = conv.messages[lastUserIdx];
     if (!lastUser || lastUser.role !== 'user') return;
+    const model = document.getElementById('model-select').value;
+    if (!model) {
+      showDialog({ title: 'No model', message: 'Select a model first.' });
+      return;
+    }
     const userText = lastUser.content.split('\n\n--- File:')[0];
+    const userImages = lastUser.images && lastUser.images.length ? lastUser.images.slice() : [];
     conv.messages.pop();
-    if (conv.messages.length === 0) { delete conversations[activeChatId]; activeChatId = null; renderSidebar(); renderChat(); return; }
+    if (conv.messages.length === 0) {
+      delete conversations[activeChatId];
+      activeChatId = null;
+      renderSidebar();
+      renderChat();
+      return;
+    }
     save();
     renderChat();
     // Auto-resend
     document.getElementById('input').value = userText;
     autoResize(document.getElementById('input'));
+    if (userImages.length) {
+      chatAttachments = userImages.map(img => ({
+        name: 'image',
+        base64: typeof img === 'string' ? img : '',
+        size: 0,
+        isImage: true,
+        mime: 'image/png'
+      }));
+      renderAttachBar();
+    }
     send();
   }
 
@@ -2098,13 +2234,6 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     const sidebarItem = t.closest('.sidebar-item');
     if (sidebarItem && sidebarItem.dataset.chat && !t.dataset.action) {
       switchChat(sidebarItem.dataset.chat);
-      return;
-    }
-
-    // Sidebar: delete chat
-    if (t.dataset.action === 'delete-chat') {
-      e.stopPropagation();
-      deleteChat(t.closest('.sidebar-item').dataset.chat);
       return;
     }
 
@@ -2261,9 +2390,13 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     this.classList.remove('open');
   });
 
-  function saveSync() {
-    try { localStorage.setItem('gooey_projects', JSON.stringify(projects)); } catch {}
-    try { localStorage.setItem('gooey_conversations', JSON.stringify(conversations)); } catch {}
+  // Keep the browser UI (address bar / status bar) in sync with the active theme
+  function syncThemeColor() {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+    const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (!document.documentElement.getAttribute('data-theme') && matchMedia('(prefers-color-scheme:dark)').matches);
+    meta.setAttribute('content', dark ? '#1a1a1a' : '#faf8f5');
   }
 
   // Theme
@@ -2271,13 +2404,21 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
   if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
   document.getElementById('theme-toggle').addEventListener('click', function() {
     const current = document.documentElement.getAttribute('data-theme');
-    const next = current === 'dark' ? 'light' : current === 'light' ? '' : 'dark';
+    let next;
+    if (current === 'dark') next = 'light';
+    else if (current === 'light') next = '';
+    else {
+      // No explicit theme — following system. If system is dark, first tap should visibly switch to light.
+      const sysDark = matchMedia('(prefers-color-scheme:dark)').matches;
+      next = sysDark ? 'light' : 'dark';
+    }
     if (next) { document.documentElement.setAttribute('data-theme', next); localStorage.setItem('gooey_theme', next); }
     else { document.documentElement.removeAttribute('data-theme'); localStorage.removeItem('gooey_theme'); }
     this.innerHTML = (next === 'dark' || (!next && matchMedia('(prefers-color-scheme:dark)').matches)) ? '&#9788;' : '&#9789;';
+    syncThemeColor();
   });
-  // Set initial icon
-  (function() { const t = document.getElementById('theme-toggle'); const d = document.documentElement.getAttribute('data-theme'); t.innerHTML = (d === 'dark' || (!d && matchMedia('(prefers-color-scheme:dark)').matches)) ? '&#9788;' : '&#9789;'; })();
+  // Set initial icon + theme color
+  (function() { const t = document.getElementById('theme-toggle'); const d = document.documentElement.getAttribute('data-theme'); t.innerHTML = (d === 'dark' || (!d && matchMedia('(prefers-color-scheme:dark)').matches)) ? '&#9788;' : '&#9789;'; syncThemeColor(); })();
 
   // --- File panel (read-only sandbox browser) ---
   let fileTree = {};
@@ -2459,6 +2600,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
   let lastRunPath = null;
   let fileTreeToken = 0;
   let previewToken = 0;
+  let compactionAbort = null;
   document.getElementById('run-rerun-btn').addEventListener('click', () => { if (lastRunPath) runFile(lastRunPath); });
   document.getElementById('run-close').addEventListener('click', () => document.getElementById('run-output').classList.remove('open'));
   document.getElementById('run-stdin').addEventListener('keydown', (e) => { if (e.key === 'Enter' && lastRunPath) runFile(lastRunPath); });
@@ -2496,10 +2638,12 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       if (token !== previewToken || activeChatId !== cid) return;
       if (data.error) { content.innerHTML = `<div class="file-empty-state">${esc(data.error)}</div>`; return; }
       if (data.binary) {
-        if (['image/png','image/jpeg','image/gif','image/webp','image/svg+xml'].includes(data.mime)) {
-          content.innerHTML = `<div class="preview" style="text-align:center;padding:24px"><img src="data:${data.mime};base64,${b64OrEmpty(data.content)}" style="max-width:100%;border-radius:8px"></div>`;
+        const m = String(data.mime || '');
+        if (/^image\/(png|jpeg|jpg|gif|webp|svg\+xml)$/.test(m)) {
+          const safeMime = (/^[\w.+-]+\/[\w.+-]+$/.test(m) ? m : 'image/png');
+          content.innerHTML = `<div class="preview" style="text-align:center;padding:24px"><img src="data:${esc(safeMime)};base64,${b64OrEmpty(data.content)}" style="max-width:100%;border-radius:8px"></div>`;
         } else {
-          content.innerHTML = `<div class="binary-preview"><p>${esc(data.mime)}</p><p>${formatSize(data.size || 0)}</p></div>`;
+          content.innerHTML = `<div class="binary-preview"><p>${esc(data.mime || '')}</p><p>${formatSize(data.size || 0)}</p></div>`;
         }
         return;
       }
@@ -2509,7 +2653,13 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       } else if (isSpreadsheet(path)) {
         content.innerHTML = `<div class="csv-table-wrap">${renderSheetTable(data.content)}</div>`;
       } else if (['png','jpg','jpeg','gif','webp','svg'].includes(ext)) {
-        content.innerHTML = `<div class="preview" style="text-align:center"><img src="data:${data.mime};base64,${b64OrEmpty(data.content)}" style="max-width:100%;border-radius:8px"></div>`;
+        const m2 = String(data.mime || '');
+        if (/^image\/(png|jpeg|jpg|gif|webp|svg\+xml)$/.test(m2)) {
+          const safeMime2 = (/^[\w.+-]+\/[\w.+-]+$/.test(m2) ? m2 : 'image/png');
+          content.innerHTML = `<div class="preview" style="text-align:center"><img src="data:${esc(safeMime2)};base64,${b64OrEmpty(data.content)}" style="max-width:100%;border-radius:8px"></div>`;
+        } else {
+          content.innerHTML = `<div class="binary-preview"><p>${esc(data.mime || '')}</p><p>${formatSize(data.size || 0)}</p></div>`;
+        }
       } else {
         const fileContent = String(data.content || '');
         let highlighted;
@@ -2537,9 +2687,11 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         const bin = atob(data.content);
         const arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        blob = new Blob([arr], { type: data.mime });
+        const safeMime = (/^[\w.+-]+\/[\w.+-]+$/.test(String(data.mime || '')) ? data.mime : 'application/octet-stream');
+        blob = new Blob([arr], { type: safeMime });
       } else {
-        blob = new Blob([data.content], { type: data.mime || 'text/plain' });
+        const safeMime = (/^[\w.+-]+\/[\w.+-]+$/.test(String(data.mime || '')) ? data.mime : 'text/plain');
+        blob = new Blob([data.content], { type: safeMime });
       }
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -2606,7 +2758,6 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
 
   // --- Web search + paused file-ops (pause/resume flows) ---
   let webSearchEnabled = false;
-  let searchResumeToken = 0;
 
   function withTimeout(ms) {
     const c = new AbortController();
@@ -2692,7 +2843,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       save();
       blocks.push({ query, results, err });
     }
-    if (streaming || token !== searchResumeToken) return;
+    if (isChatStreaming(chatId) || token !== resumeToken(chatId)) return;
     if (!chatId || !conversations[chatId]) return;
     if (!msg || conversations[chatId].messages[conversations[chatId].messages.length - 1] !== msg) return;
     const formatted = blocks.map((b, i) => {
@@ -2798,7 +2949,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       }
     } catch (e) { err = (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) ? 'Info file read timed out.' : (e.message || 'Failed to read the info file.'); }
     save();
-    if (streaming || token !== searchResumeToken) return;
+    if (isChatStreaming(chatId) || token !== resumeToken(chatId)) return;
     if (!chatId || !conversations[chatId]) return;
     let injected;
     if (err) {
@@ -2813,7 +2964,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         ? 'Info file search for "' + qv + '":\n' + results.map(r => 'Entry ' + r.entry + ': [' + r.heading + ']\n' + r.snippet).join('\n') + '\n\nTo read any matching entry in full, emit <read_info>ENTRY_CODE</read_info> copying the Entry Code exactly from the list above. Answer using this knowledge and continue.'
         : 'Info file search for "' + qv + '" found nothing. If helpful, say so briefly, then continue normally.';
     }
-    if (streaming || token !== searchResumeToken) return;
+    if (isChatStreaming(chatId) || token !== resumeToken(chatId)) return;
     if (!chatId || !conversations[chatId]) return;
     if (!msg || conversations[chatId].messages[conversations[chatId].messages.length - 1] !== msg) return;
     if (lastRow && lastRow.isConnected) {
@@ -2890,19 +3041,24 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     return null;
   }
 
-  async function fetchInfoForInject(q) {
-    const r = await fetch('/api/info?q=' + encodeURIComponent(q));
-    if (!r.ok) return null;
-    const d = await r.json();
-    const res = d.results || [];
-    if (!res.length) return null;
-    return 'Stored facts about the CURRENT USER (from extra-info.md). The person you are talking to right now IS this person — these facts (e.g. "Akiva", age 12) describe the user who is messaging you, NOT a third party. The user is allowed to know and discuss all of it; answer directly from it, never withhold it, and never refer to "the user" as someone other than the person chatting with you. The full answer is already here — reply immediately and do NOT emit any XML tags (no <search_info>, <read_info>, or others); just answer the question:\n\n' +
-      res.slice(0, 4).map(it => 'Entry ' + it.entry + ': [' + it.heading + ']\n' + it.snippet).join('\n\n');
+  async function fetchInfoForInject(q, signal) {
+    const to = withTimeout(30000);
+    try {
+      const r = await fetch('/api/info?q=' + encodeURIComponent(q), { signal: signal || to.signal });
+      if (!r.ok) return null;
+      const d = await r.json();
+      const res = d.results || [];
+      if (!res.length) return null;
+      return 'Stored facts about the CURRENT USER (from extra-info.md). The person you are talking to right now IS this person — these facts (e.g. "Akiva", age 12) describe the user who is messaging you, NOT a third party. The user is allowed to know and discuss all of it; answer directly from it, never withhold it, and never refer to "the user" as someone other than the person chatting with you. The full answer is already here — reply immediately and do NOT emit any XML tags (no <search_info>, <read_info>, or others); just answer the question:\n\n' +
+        res.slice(0, 4).map(it => 'Entry ' + it.entry + ': [' + it.heading + ']\n' + it.snippet).join('\n\n');
+    } finally {
+      to.cancel();
+    }
   }
 
   async function runChatSearchAndResume(query, lastRow, chatId, token) {
     save();
-    if (streaming || token !== searchResumeToken) return;
+    if (isChatStreaming(chatId) || token !== resumeToken(chatId)) return;
     if (!chatId || !conversations[chatId]) return;
     const conv = conversations[chatId];
     const pausedMsg = conv.messages[conv.messages.length - 1];
@@ -2911,7 +3067,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     const curProject = conv.projectId || null;
     const external = matches.filter(m => m.projectId !== curProject);
     const freshCheck = function() {
-      return !streaming && token === searchResumeToken && conversations[chatId] && conversations[chatId].messages[conversations[chatId].messages.length - 1] === pausedMsg;
+      return !isChatStreaming(chatId) && token === resumeToken(chatId) && conversations[chatId] && conversations[chatId].messages[conversations[chatId].messages.length - 1] === pausedMsg;
     };
     if (external.length === 0) {
       if (freshCheck()) {
@@ -2978,11 +3134,12 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
     const ops = msg.fileOps || [];
     if (!ops.length) { msg.resumePending = false; save(); return; }
     if (ops.some(op => (op.status || 'pending') === 'pending')) return;
-    if (streaming) { setTimeout(() => maybeResume(conv, msgIdx), 800); return; }
     let chatId = null;
     for (const id of Object.keys(conversations)) { if (conversations[id] === conv) chatId = id; }
     if (!chatId) return;
-    if (activeChatId !== chatId) return;
+    // Reschedule (instead of dropping) while this chat is busy or not visible —
+    // the resume fires when the stream ends or the user switches back (#82)
+    if (isChatStreaming(chatId) || activeChatId !== chatId) { setTimeout(() => maybeResume(conv, msgIdx), 800); return; }
     msg.resumePending = false;
     save();
     const results = ops.map(op => ({ op: { type: op.type, path: op.path }, error: op.errMessage || null, skipped: op.status === 'skipped', content: (op.type === 'read_file' && op.status === 'applied') ? op.content : undefined }));
@@ -3092,11 +3249,16 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
   });
 
   // --- Init ---
+  // Catch-all so a rejected promise anywhere (init, model loading, async handlers)
+  // can never break input handling (#75)
+  window.addEventListener('unhandledrejection', function(e) {
+    try { console.error('Unhandled promise rejection in gooey:', e.reason); } catch {}
+  });
   (async function() {
     try { webSearchEnabled = localStorage.getItem('gooey_websearch') !== '0'; } catch {}
     loadParams();
     await loadStorage();
-    loadModels();
+    loadModels().catch(function(e) { try { console.error('loadModels failed:', e); } catch {} });
     renderSidebar();
     const lastActive = localStorage.getItem('gooey_active_chat');
     if (lastActive && conversations[lastActive]) {
@@ -3106,6 +3268,9 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       updateTopbar();
       checkResumeOnSwitch();
     }
-  })();
-  setInterval(() => { if (activeChatId) localStorage.setItem('gooey_active_chat', activeChatId); }, 1000);
+  })().catch(function(e) { try { console.error('gooey init failed:', e); } catch {} });
+  setInterval(() => {
+    if (!activeChatId) return;
+    try { if (localStorage.getItem('gooey_active_chat') !== activeChatId) localStorage.setItem('gooey_active_chat', activeChatId); } catch {}
+  }, 1000);
 })();

@@ -67,4 +67,4 @@ python3 gooey_cli.py list     # list sessions for this folder
 
 ## License
 
-No license attached yet.
+MIT License. See LICENSE.

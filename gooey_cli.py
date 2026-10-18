@@ -71,7 +71,13 @@ def _json_body(resp):
 def http_get(url, timeout=20):
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.headers, _json_body(r), r.read()
+        b = r.read()
+        status, headers = r.status, r.headers
+    try:
+        body = json.loads(b.decode("utf-8", "replace"))
+    except Exception:
+        body = {}
+    return status, headers, body, b
 
 
 def get_models():
@@ -139,14 +145,40 @@ def sessions_path():
 
 
 def load_sessions():
+    p = sessions_path()
+    corrupted = False
     try:
-        with open(sessions_path(), "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        print("Warning: {} is corrupt; starting with no sessions".format(sessions_path()), file=sys.stderr)
-    return {}
+    except (OSError, json.JSONDecodeError):
+        corrupted = True
+        data = {}
+        backup = p + ".corrupt." + str(int(time.time()))
+        try:
+            if os.path.exists(p):
+                shutil.copy2(p, backup)
+        except Exception:
+            pass
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
+            finally:
+                try: os.close(fd)
+                except Exception: pass
+        except Exception:
+            pass
+        print("Warning: {} is corrupt; starting with no sessions (backup: {})".format(p, backup), file=sys.stderr)
+    if not isinstance(data, dict):
+        data = {}
+    if corrupted:
+        data["corrupt"] = True
+    return data
 
 
 def save_sessions(data):
@@ -157,20 +189,31 @@ def save_sessions(data):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=None, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
         except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        print("Warning: failed to save sessions: {}".format(e), file=sys.stderr)
 
 
 def sessions_for_folder(folder):
     with _sessions_lock:
-        return load_sessions().get(os.path.realpath(folder) or folder, [])
+        real = os.path.realpath(folder) or folder
+        return load_sessions().get(real, [])
 
 
 def put_session(folder, session):
@@ -275,7 +318,7 @@ class AgentPool:
     def children_of(self, aid):
         a = self.agents.get(aid)
         if not a:
-            return [x for x in self.order if not any(c in self.agents for c in [])]
+            return []
         return [self.agents[c] for c in a.child_ids if c in self.agents]
 
 
@@ -420,9 +463,10 @@ class GooeyApp(App):
             put_session(self.project, sess)
 
     def refresh_models(self):
-        if not self.models:
-            self.models = get_models()
-            if self.models and not self.model:
+        got = get_models()
+        if got:
+            self.models = got
+            if not self.model or self.model not in self.models:
                 self.model = self.models[0]
 
     def ensure_context(self):
@@ -432,7 +476,7 @@ class GooeyApp(App):
             return self._ctx_text
         self._ctx_check_time = now
         text, mtime = get_project_context(self.project)
-        if mtime is not None and (text, mtime) != (self._ctx_text, self._ctx_mtime):
+        if (text, mtime) != (self._ctx_text, self._ctx_mtime):
             self._ctx_text = text
             self._ctx_mtime = mtime
         return self._ctx_text
@@ -502,11 +546,16 @@ class GooeyApp(App):
         self.ensure_context()
         if self.models:
             self.model_pick.set_options([(str(m), m) for m in self.models])
-            if sess.get("model"):
+            if sess.get("model") and sess.get("model") in self.models:
                 self.model_pick.value = sess["model"]
                 self.model = sess["model"]
-            elif self.model:
+            elif self.model and self.model in self.models:
                 self.model_pick.value = self.model
+            else:
+                self.model = self.models[0]
+                self.model_pick.value = self.model
+        else:
+            self.model = None
         self.update_header()
         self.redraw_messages()
         self.input.focus()
@@ -516,7 +565,7 @@ class GooeyApp(App):
         sid = sess.get("id") if sess else "-"
         ctx = "  [gooey.md context]" if self._ctx_text else ""
         name = os.path.basename(self.project) or self.project
-        model = sess.get("model") or "no model"
+        model = sess.get("model") or (self.model or "no model")
         self.meta_label.update("{}  ·  session {}  ·  {}{}".format(name, sid[-6:], model, ctx))
 
     @staticmethod
@@ -623,7 +672,8 @@ class GooeyApp(App):
         if not sess:
             sess = self.resolve_session()
         if not sess.get("title") or sess.get("title") == "New session":
-            sess["title"] = stripped[:40]
+            title = stripped.splitlines()[0] if stripped else "New session"
+            sess["title"] = title[:40]
         sess["messages"].append({"role": "user", "content": stripped, "ts": time.time()})
         sess["messages"].append({"role": "assistant", "content": "", "ts": time.time()})
         sess["model"] = self.model
@@ -651,9 +701,15 @@ class GooeyApp(App):
         stop = False
         sid = self.active_id
         sess = self._active_session()
+        if sess is None:
+            self._stop = False
+            self.streaming = False
+            self.call_from_thread(self.render_stop_button, False)
+            self.call_from_thread(self.set_status, "No session")
+            return
         idx = len(sess["messages"]) - 1
         dolog = self.call_from_thread
-        if sess is None or idx < 0 or sess["messages"][idx].get("role") != "assistant":
+        if idx < 0 or sess["messages"][idx].get("role") != "assistant":
             self._stop = False
             if self.active_id == sid:
                 self.streaming = False
@@ -666,7 +722,8 @@ class GooeyApp(App):
 
         def write_chunk(content):
             if self.active_id == sid:
-                dolog(self.live_bubble.update, "[bold cyan]gooey:[/bold cyan] " + content)
+                safe = content.replace("[", "[[").replace("]", "]]")
+                dolog(self.live_bubble.update, "[bold cyan]gooey:[/bold cyan] " + safe)
 
         def commit_display():
             if self.active_id != sid:
@@ -679,7 +736,7 @@ class GooeyApp(App):
             for chunk in stream_chat(msgs, self.model):
                 if self._stop:
                     break
-                if idx < len(sess["messages"]):
+                if sess and idx < len(sess["messages"]):
                     sess["messages"][idx]["content"] += chunk
                 self.assistant_buffer += chunk
                 now = time.monotonic()
@@ -688,27 +745,28 @@ class GooeyApp(App):
                     write_chunk(self.assistant_buffer)
                 if now - last_flush >= SAVE_FLUSH_SECS:
                     last_flush = now
-                    self.save_session(sess, persist=True)
+                    self.save_session(sess, persist=True) if sess else None
             stop = self._stop
             if stop:
-                if idx < len(sess["messages"]):
+                if sess and idx < len(sess["messages"]):
                     sess["messages"][idx]["content"] += "\n\n*[stopped]*"
             commit_display()
-            self._cap_session_messages(sess)
+            if sess:
+                self._cap_session_messages(sess)
         except Exception as e:
             self._errored = True
-            if idx < len(sess["messages"]):
+            if sess and idx < len(sess["messages"]):
                 sess["messages"][idx]["content"] = (sess["messages"][idx]["content"] or "") + "\n\n*[Error: {}]*".format(e)
             dolog(self.live_bubble.update, "")
-            if self.active_id == sid:
+            if self.active_id == sid and sess and idx < len(sess["messages"]):
                 dolog(self.messages.write, self._chat_line("gooey:", "bold cyan", sess["messages"][idx].get("content") or ""))
                 dolog(self.messages.scroll_end, animate=False)
             dolog(self.set_status, "Error: " + str(e))
         finally:
             dolog(self.live_bubble.update, "")
-            if idx < len(sess["messages"]):
+            if sess:
                 self._cap_session_messages(sess)
-            self.save_session(sess, persist=True)
+                self.save_session(sess, persist=True)
             if self.active_id == sid:
                 self.streaming = False
                 dolog(self.render_stop_button, False)
@@ -748,15 +806,18 @@ class GooeyApp(App):
             self.set_status("No session to export.")
             return
         title = (sess.get("title") or "session").replace(" ", "_")
-        lines = ["# " + (sess.get("title") or "session"), ""]
+        header = sess.get("title") or "session"
+        lines = ["# " + header, ""]
         for m in sess.get("messages", []):
             if m.get("role") == "system":
                 continue
             who = "You" if m["role"] == "user" else "Assistant"
-            lines.append("## " + who + "\n")
-            lines.append(str(m.get("content") or "") + "\n")
+            lines.append("## " + who)
+            lines.append("")
+            lines.append(str(m.get("content") or ""))
+            lines.append("")
         md = "\n".join(lines)
-        fname = "gooey-export-{}.md".format(re.sub(r"[^A-Za-z0-9]", "_", title))
+        fname = "gooey-export-{}.md".format(re.sub(r"[^A-Za-z0-9_-]+", "_", title.strip()))
         outpath = os.path.join(self.project, fname)
         try:
             with open(outpath, "w", encoding="utf-8") as f:
@@ -775,9 +836,18 @@ class GooeyApp(App):
             return
         model = self.model or SUBAGENT_DEFAULT
         if "model:" in goal:
-            goal, model = goal.split("model:", 1)
-            goal = goal.rstrip()
-            model = model.strip().split()[0]
+            # Only split on model: if it appears; also handle empty model case
+            try:
+                goal, mpart = goal.split("model:", 1)
+                goal = goal.rstrip()
+                mpart = mpart.strip()
+                if mpart:
+                    model = mpart.split()[0]
+            except Exception:
+                pass
+        if not model:
+            self.set_status("Cannot spawn: no model specified")
+            return
         if _model_class(model) == "7b" and self.pool.reserved_gb() > 0:
             self.set_status("7B sub-agent refused: already {}GB reserved (one 7B at a time).".format(
                 round(self.pool.reserved_gb(), 1)))
@@ -809,10 +879,10 @@ class GooeyApp(App):
                 tmp += chunk
                 agent.buffer = tmp
                 agent.heartbeat = "thinking / writing ({})".format(len(tmp))
-                if len(agent.buffer) > 0 and len(agent.buffer) % 200 < 20:
+                if len(agent.buffer) % 200 < 20:
                     self._touch_agent(agent)
             agent.phase = "done"
-            agent.result = agent.buffer.replace("\n", "").strip()
+            agent.result = agent.buffer.rstrip("\n\r")
             agent.heartbeat = "finished"
         except Exception as e:
             agent.phase = "failed"
@@ -857,16 +927,26 @@ class GooeyApp(App):
             ("\n[bold]output[/bold]\n" + (a.buffer or ""), ""),
         ]
         for text, style in lines:
-            body.write(Text(text, style=style) if style else Text(text))
+            try:
+                body.write(Text(text, style=style) if style else Text(text))
+            except Exception:
+                body.write(str(text))
         body.scroll_end(animate=False)
 
     def _update_agent_summary(self):
         if not self.pool.order:
+            self.statusbar.update("")
             return
-        s = ", ".join(
-            "{} {} {}".format(aid, self.pool.agents[aid].phase, (self.pool.agents[aid].heartbeat or "")[:40])
-            for aid in self.pool.order if aid in self.pool.agents)
-        self.statusbar.update("agents: " + s + "   |   Ctrl+X ↓ watch   ← → switch   ↑ back")
+        parts = []
+        for aid in self.pool.order:
+            a = self.pool.agents.get(aid)
+            if not a:
+                continue
+            parts.append("{} {} {}".format(aid, a.phase, (a.heartbeat or "")[:40]))
+        if not parts:
+            self.statusbar.update("")
+            return
+        self.statusbar.update("agents: " + ", ".join(parts) + "   |   Ctrl+X ↓ watch   ← → switch   ↑ back")
 
     def _switch_to_agent_view(self, aid=None):
         self._render_agent_view(aid)
@@ -896,7 +976,13 @@ class GooeyApp(App):
         if not kids:
             return
         cur = self.focus_stack[-1]
-        idx = next((i for i, k in enumerate(kids) if k.id == cur), -1)
+        idx = -1
+        for i, k in enumerate(kids):
+            if k.id == cur:
+                idx = i
+                break
+        if idx == -1:
+            return
         nxt = kids[(idx + delta) % len(kids)].id
         self.focus_stack[-1] = nxt
         self._switch_to_agent_view(nxt)
@@ -948,7 +1034,10 @@ def print_sessions(folder):
         sid = s.get("id", "?")
         title = (s.get("title") or "Untitled")
         model = s.get("model") or "?"
-        n = len([m for m in s.get("messages", []) if m.get("role") in ("user", "assistant")])
+        n = 0
+        for m in s.get("messages", []):
+            if m.get("role") in ("user", "assistant"):
+                n += 1
         t = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("updated") or 0))
         print("  {:<15} {:>3} msgs  {:<14} {:<30} {}".format(sid, n, model, title[:28], t))
     print("\nResume:  gooey -r <id>")
@@ -963,8 +1052,8 @@ def main(argv=None):
     ap.add_argument("-d", "--dir", default=None, help="project folder (default: current directory)")
     ap.add_argument("list", nargs="?", const=True, default=None, help="list sessions in the project folder")
     args = ap.parse_args(argv)
-    SERVER = args.server
-    OLLAMA = args.ollama
+    SERVER = args.server.rstrip("/")
+    OLLAMA = args.ollama.rstrip("/")
     folder = os.path.realpath(args.dir or os.getcwd())
     if args.list:
         print_sessions(folder)

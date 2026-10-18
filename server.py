@@ -1,6 +1,10 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse
-import json, os, tempfile, shutil, mimetypes, subprocess, re, hashlib, sys, time, threading
+import json, os, tempfile, shutil, mimetypes, subprocess, re, hashlib, sys, time, threading, signal, traceback, contextlib
+try:
+    import resource
+except ImportError:
+    resource = None
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -10,13 +14,16 @@ SANDBOX_ROOT = os.path.join(BASE_DIR, "sandbox")
 INFO_FILE = os.path.join(BASE_DIR, "extra-info.md")
 MAX_BODY = 10 * 1024 * 1024
 MAX_FILE_SIZE = 5 * 1024 * 1024
+MAX_LIST_ITEMS = 1000
+RUN_OUT_MAX = 8 * 1024 * 1024
 RUN_TIMEOUT = 30
+MAX_CONN_SEM = threading.Semaphore(32)
 RUNNABLE_EXTS = {'.py', '.sh', '.js', '.ts', '.rb', '.pl', '.php'}
 VENDOR_DIR = os.path.join(BASE_DIR, "vendor")
-VENDOR_WHITELIST = ("marked.min.js", "dompurify.min.js", "highlight.min.js")
+VENDOR_WHITELIST = ("marked.min.js", "dompurify.min.js", "highlight.min.js", "highlight-github.min.css")
 INFO_MAX_SIZE = 2 * 1024 * 1024
 OUTPUT_CAP = 1024 * 1024
-STORAGE_LOCK = threading.Lock()
+STORAGE_LOCK = threading.RLock()  # re-entrant: read_storage() archives under the same lock handlers hold
 RUN_SEM = threading.Semaphore(4)
 SEARCH_SEM = threading.Semaphore(2)
 FILE_LOCKS = {}
@@ -25,26 +32,31 @@ FILE_LOCKS_GUARD = threading.Lock()
 os.makedirs(SANDBOX_ROOT, exist_ok=True)
 
 def read_storage():
-    data = {}
-    if os.path.exists(STORAGE_FILE):
-        try:
-            with open(STORAGE_FILE, "r") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data = loaded
-        except json.JSONDecodeError:
-            backup = STORAGE_FILE + ".corrupt." + str(int(time.time()))
+    with STORAGE_LOCK:
+        data = {}
+        if os.path.exists(STORAGE_FILE):
             try:
-                os.replace(STORAGE_FILE, backup)
-                print(f"[storage] corrupt storage.json archived to {backup}", file=sys.stderr)
-            except OSError:
-                pass
-            data = {}
-        except OSError:
-            data = {}
-    if not isinstance(data.get("revision"), int):
-        data["revision"] = 0
-    return data
+                with open(STORAGE_FILE, "r") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except json.JSONDecodeError:
+                # Archive only while holding STORAGE_LOCK so a freshly written
+                # valid file is never renamed away by a stale reader, and use a
+                # unique suffix so two corruptions can't clobber each other.
+                backup = STORAGE_FILE + ".corrupt." + str(time.time_ns())
+                try:
+                    os.replace(STORAGE_FILE, backup)
+                    print(f"[storage] corrupt storage.json archived to {backup}", file=sys.stderr)
+                except OSError:
+                    pass
+                data = {}
+            except OSError as e:
+                print(f"[storage] read failed: {e}", file=sys.stderr)
+                raise
+        if not isinstance(data.get("revision"), int):
+            data["revision"] = 0
+        return data
 
 def write_storage(data):
     dir_name = os.path.dirname(STORAGE_FILE)
@@ -70,15 +82,101 @@ def write_storage(data):
 
 def _get_file_lock(chat_id):
     with FILE_LOCKS_GUARD:
-        lock = FILE_LOCKS.get(chat_id)
-        if lock is None:
-            lock = threading.Lock()
-            FILE_LOCKS[chat_id] = lock
-            if len(FILE_LOCKS) > 64:
-                stale = [k for k, v in FILE_LOCKS.items() if not v.locked() and k != chat_id]
-                for k in stale:
+        entry = FILE_LOCKS.get(chat_id)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            FILE_LOCKS[chat_id] = entry
+        entry[1] += 1  # refcount: locks handed out are never evicted
+        return entry
+
+def _release_file_lock(entry):
+    with FILE_LOCKS_GUARD:
+        entry[1] -= 1
+        if entry[1] <= 0 and len(FILE_LOCKS) > 64:
+            for k, v in list(FILE_LOCKS.items()):
+                if v[1] <= 0:
                     del FILE_LOCKS[k]
-        return lock
+
+@contextlib.contextmanager
+def _chat_file_lock(chat_id):
+    entry = _get_file_lock(chat_id)
+    try:
+        with entry[0]:
+            yield
+    finally:
+        _release_file_lock(entry)
+
+# Per-chat "run in progress" state: writers wait for active runs instead of
+# holding the per-chat file lock across a 30s subprocess (starvation issue).
+# Lock ordering is always file lock -> RUN_STATE_LOCK; _wait_runs_idle is only
+# called WITHOUT holding the file lock, so GETs are never stalled by a wait.
+RUN_STATE_LOCK = threading.Lock()
+RUN_STATE = {}  # chat_id -> number of active runs
+RUN_STATE_COND = threading.Condition(RUN_STATE_LOCK)
+
+def _run_state_begin(chat_id):
+    with RUN_STATE_COND:
+        RUN_STATE[chat_id] = RUN_STATE.get(chat_id, 0) + 1
+
+def _run_state_end(chat_id):
+    with RUN_STATE_COND:
+        n = RUN_STATE.get(chat_id, 0) - 1
+        if n <= 0:
+            RUN_STATE.pop(chat_id, None)
+        else:
+            RUN_STATE[chat_id] = n
+        RUN_STATE_COND.notify_all()
+
+def _wait_runs_idle(chat_id, timeout):
+    deadline = time.monotonic() + timeout
+    with RUN_STATE_COND:
+        while RUN_STATE.get(chat_id, 0) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            RUN_STATE_COND.wait(remaining)
+    return True
+
+@contextlib.contextmanager
+def _exclusive_chat(chat_id, timeout):
+    """Hold the per-chat file lock with no run active.
+
+    Waits for runs to finish OUTSIDE the lock (so GETs stay responsive), then
+    takes the lock and re-checks: runs mark themselves active while holding
+    this lock, so once we hold it, no run can start. Raises TimeoutError.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _wait_runs_idle(chat_id, max(0.0, deadline - time.monotonic())):
+            raise TimeoutError
+        entry = _get_file_lock(chat_id)
+        entry[0].acquire()
+        if RUN_STATE.get(chat_id, 0) == 0:
+            break
+        entry[0].release()
+        _release_file_lock(entry)
+    try:
+        yield
+    finally:
+        entry[0].release()
+        _release_file_lock(entry)
+
+def _exclusive_chat_acquire(chat_id, timeout):
+    """Like _exclusive_chat but explicit: returns a held entry or None."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _wait_runs_idle(chat_id, max(0.0, deadline - time.monotonic())):
+            return None
+        entry = _get_file_lock(chat_id)
+        entry[0].acquire()
+        if RUN_STATE.get(chat_id, 0) == 0:
+            return entry
+        entry[0].release()
+        _release_file_lock(entry)
+
+def _exclusive_chat_release(entry):
+    entry[0].release()
+    _release_file_lock(entry)
 
 def _tail_output(path, cap=OUTPUT_CAP):
     try:
@@ -129,7 +227,12 @@ def list_files(rel_dir, chat_id):
     if not full or not os.path.isdir(full):
         return []
     items = []
-    for name in sorted(os.listdir(full)):
+    try:
+        names = sorted(os.listdir(full))
+    except OSError:
+        return []
+    truncated = len(names) > MAX_LIST_ITEMS
+    for name in names[:MAX_LIST_ITEMS]:
         fp = os.path.join(full, name)
         rel = os.path.join(rel_dir, name) if rel_dir else name
         is_dir = os.path.isdir(fp)
@@ -143,6 +246,8 @@ def list_files(rel_dir, chat_id):
             except OSError:
                 pass
         items.append(item)
+    if truncated and items:
+        items[-1]["truncated"] = True  # marker: listing was capped
     return items
 
 def tree_files(rel_dir, chat_id, depth=0, max_depth=4):
@@ -172,13 +277,24 @@ def ddg_search(q, max_results=6):
         return None, "busy"
     try:
         try:
+            deadline = time.monotonic() + 12  # overall budget, not just per-op
             with urlopen(req, timeout=10) as resp:
                 status = resp.status if hasattr(resp, "status") else resp.getcode()
                 if status != 200:
                     if status in (202, 403, 429):
                         return None, "blocked"
                     return None, f"search status {status}"
-                raw = resp.read(512 * 1024).decode("utf-8", "replace")
+                chunks = []
+                got = 0
+                while got < 512 * 1024:
+                    if time.monotonic() > deadline:
+                        return None, "search timed out"
+                    chunk = resp.read(min(64 * 1024, 512 * 1024 - got))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    got += len(chunk)
+                raw = b"".join(chunks).decode("utf-8", "replace")
         except Exception as e:
             return None, str(e)
     finally:
@@ -380,6 +496,10 @@ def _is_run_body(body):
     return isinstance(body.get("path"), str) and bool(body.get("path")) and "chatId" in body
 
 class Handler(SimpleHTTPRequestHandler):
+    server_version = "gooey"  # don't leak Python version (issue: header leak)
+    sys_version = ""
+    timeout = 30  # bound slowloris: stalled request-line/header reads
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=BASE_DIR, **kwargs)
 
@@ -387,23 +507,51 @@ class Handler(SimpleHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not origin:
             return
-        hostname = urlparse(origin).hostname
-        if hostname and hostname.startswith("[") and hostname.endswith("]"):
-            hostname = hostname[1:-1]
-        if hostname not in ("127.0.0.1", "localhost", "::1"):
-            return
-        self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Vary", "Origin")
+        # Only reflect this server's own origin (scheme + host + port), so no
+        # other local app on a different port can read API responses.
+        try:
+            port = self.server.server_address[1]
+            allowed = (
+                f"http://127.0.0.1:{port}",
+                f"http://localhost:{port}",
+                f"http://[::1]:{port}",
+            )
+            if origin not in allowed:
+                return
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        except Exception:
+            pass
 
     def _check_origin(self):
         origin = self.headers.get("Origin")
         if origin:
-            if origin != "http://" + (self.headers.get("Host") or ""):
+            try:
+                o = urlparse(origin)
+                h = urlparse("http://" + (self.headers.get("Host") or ""))
+                ohost = o.hostname
+                hhost = h.hostname
+                if ohost and ohost.startswith("[") and ohost.endswith("]"):
+                    ohost = ohost[1:-1]
+                if hhost and hhost.startswith("[") and hhost.endswith("]"):
+                    hhost = hhost[1:-1]
+                if ohost != hhost:
+                    self._json_response(403, {"error": "forbidden origin"})
+                    return False
+                oport = o.port
+                hport = h.port
+                if oport and hport and oport != hport:
+                    pass  # allow if hosts match; still localhost
+                return True
+            except Exception:
                 self._json_response(403, {"error": "forbidden origin"})
                 return False
-            return True
         host = self.headers.get("Host") or ""
-        hostname = urlparse("http://" + host).hostname
+        try:
+            hostname = urlparse("http://" + host).hostname
+        except Exception:
+            self._json_response(403, {"error": "forbidden origin"})
+            return False
         if hostname and hostname.startswith("[") and hostname.endswith("]"):
             hostname = hostname[1:-1]
         if hostname not in ("127.0.0.1", "localhost", "::1"):
@@ -419,12 +567,18 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _json_response(self, code, obj):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+        except Exception:
+            print("[handler] error sending response", file=sys.stderr)
+            traceback.print_exc()
 
     def _read_body(self):
         if self.headers.get("Transfer-Encoding", "").lower().strip() == "chunked":
@@ -473,12 +627,20 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             path_no_query = self.path.split("?")[0]
             if path_no_query == "/api/storage":
+                if not self._check_origin():
+                    return
                 self._json_response(200, read_storage())
             elif path_no_query == "/api/search":
+                if not self._check_origin():
+                    return
                 self._handle_search()
             elif path_no_query == "/api/info":
+                if not self._check_origin():
+                    return
                 self._handle_info()
             elif path_no_query == "/api/files" or path_no_query.startswith("/api/files/"):
+                if not self._check_origin():
+                    return
                 self._handle_files_get()
             elif path_no_query in ("/", "/index.html"):
                 self._serve_static("index.html")
@@ -488,12 +650,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self._serve_static("style.css")
             elif path_no_query == "/app.js":
                 self._serve_static("app.js")
+            elif path_no_query == "/sw.js":
+                self._serve_static("sw.js")
             elif path_no_query.startswith("/vendor/"):
                 self._serve_vendor(path_no_query[len("/vendor/"):])
             else:
                 self.send_error(404)
         except Exception:
-            self._json_response(500, {"error": "internal error"})
+            print("[handler] GET exception", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                self._json_response(500, {"error": "internal error"})
+            except Exception:
+                pass
 
     def _serve_static(self, name):
         full = os.path.join(BASE_DIR, name)
@@ -501,7 +670,10 @@ class Handler(SimpleHTTPRequestHandler):
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self.send_error(404)
+            try:
+                self.send_error(404)
+            except Exception:
+                pass
             return
         self.send_response(200)
         ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
@@ -512,18 +684,24 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def _serve_vendor(self, name):
-        if not name or "/" in name or "\\" in name or ".." in name:
+        if not name or "/" in name and not name.startswith("icons/") or "\\" in name or ".." in name:
             self.send_error(404)
             return
-        if name not in VENDOR_WHITELIST:
+        if name not in VENDOR_WHITELIST and not name.startswith("icons/"):
             self.send_error(404)
             return
-        full = os.path.join(VENDOR_DIR, name)
+        full = os.path.realpath(os.path.join(VENDOR_DIR, name))
+        if not full.startswith(os.path.realpath(VENDOR_DIR) + os.sep):
+            self.send_error(404)
+            return
         try:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self.send_error(404)
+            try:
+                self.send_error(404)
+            except Exception:
+                pass
             return
         self.send_response(200)
         ctype = mimetypes.guess_type(name)[0] or "application/javascript"
@@ -561,18 +739,22 @@ class Handler(SimpleHTTPRequestHandler):
                     old_rev = old.get("revision") if isinstance(old, dict) else None
                     old_rev = old_rev if isinstance(old_rev, int) else 0
                     if "revision" in body:
-                        rev = body["revision"]
-                        if isinstance(rev, bool) or not isinstance(rev, int):
-                            self._json_response(400, {"error": "revision must be an integer"})
-                            return
-                        if rev < old_rev:
-                            self._json_response(409, {"error": "revision conflict", "revision": old_rev})
-                            return
+                        rev_req = body["revision"]
+                        if isinstance(rev_req, bool) or not isinstance(rev_req, int):
+                            resp = (400, {"error": "revision must be an integer"})
+                        elif rev_req <= old_rev:
+                            resp = (409, {"error": "revision conflict", "revision": old_rev})
+                        else:
+                            rev_new = rev_req
+                            body["revision"] = rev_new
+                            write_storage(body)
+                            resp = (200, {"ok": True, "revision": rev_new})
                     else:
-                        rev = old_rev + 1
-                    body["revision"] = rev
-                    write_storage(body)
-                    self._json_response(200, {"ok": True, "revision": rev})
+                        rev_new = old_rev + 1
+                        body["revision"] = rev_new
+                        write_storage(body)
+                        resp = (200, {"ok": True, "revision": rev_new})
+                self._json_response(*resp)
             elif path_no_query == "/api/files/run":
                 body = self._read_body()
                 if body is None: return
@@ -585,7 +767,12 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception:
-            self._json_response(500, {"error": "internal error"})
+            print("[handler] POST exception", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                self._json_response(500, {"error": "internal error"})
+            except Exception:
+                pass
 
     def do_PUT(self):
         try:
@@ -600,7 +787,12 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception:
-            self._json_response(500, {"error": "internal error"})
+            print("[handler] PUT exception", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                self._json_response(500, {"error": "internal error"})
+            except Exception:
+                pass
 
     def do_DELETE(self):
         try:
@@ -614,13 +806,18 @@ class Handler(SimpleHTTPRequestHandler):
                     old_rev = old.get("revision") if isinstance(old, dict) else None
                     old_rev = old_rev if isinstance(old_rev, int) else 0
                     write_storage({"projects": {}, "conversations": {}, "revision": old_rev + 1})
-                    self._json_response(200, {"ok": True})
+                self._json_response(200, {"ok": True})
             elif path_no_query == "/api/files" or path_no_query.startswith("/api/files/"):
                 self._handle_files_delete()
             else:
                 self.send_error(404)
         except Exception:
-            self._json_response(500, {"error": "internal error"})
+            print("[handler] DELETE exception", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                self._json_response(500, {"error": "internal error"})
+            except Exception:
+                pass
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -715,40 +912,46 @@ class Handler(SimpleHTTPRequestHandler):
         if not full:
             self._json_response(400, {"error": "invalid path"})
             return
-        if not os.path.exists(full):
-            self._json_response(404, {"error": "not found"})
-            return
-        if os.path.isdir(full):
-            self._json_response(200, {"files": list_files(rel_path, chat_id)})
-            return
+        with _chat_file_lock(chat_id):
+            if not os.path.exists(full):
+                self._json_response(404, {"error": "not found"})
+                return
+            if os.path.isdir(full):
+                self._json_response(200, {"files": list_files(rel_path, chat_id)})
+                return
 
-        stat = os.stat(full)
-        if stat.st_size > MAX_FILE_SIZE:
-            self._json_response(413, {"error": "file too large"})
-            return
-        mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
-        ext = os.path.splitext(rel_path)[1].lower()
-        is_text = mime.startswith("text/") or mime in ("application/json", "application/javascript", "application/xml") or mime.endswith("+json") or mime.endswith("+xml")
-
-        sheet_text = None
-        if not is_text and ext in ('.xlsx', '.xls', '.ods', '.csv', '.tsv'):
-            sheet_text = self._sheet_as_text(full)
-
-        if is_text or sheet_text is not None:
             try:
-                if sheet_text is not None:
-                    content = sheet_text
+                stat = os.stat(full)
+            except OSError:
+                # concurrent delete → 404 rather than a 500
+                self._json_response(404, {"error": "not found"})
+                return
+            if stat.st_size > MAX_FILE_SIZE:
+                self._json_response(413, {"error": "file too large"})
+                return
+            mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
+            ext = os.path.splitext(rel_path)[1].lower()
+            is_text = mime.startswith("text/") or mime in ("application/json", "application/javascript", "application/xml") or mime.endswith("+json") or mime.endswith("+xml")
+
+            sheet_text = None
+            if not is_text and ext in ('.xlsx', '.xls', '.ods', '.csv', '.tsv'):
+                sheet_text = self._sheet_as_text(full)
+
+            try:
+                if is_text or sheet_text is not None:
+                    if sheet_text is not None:
+                        content = sheet_text
+                    else:
+                        with open(full, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                    self._json_response(200, {"content": content, "mime": mime, "size": stat.st_size, "path": rel_path, "sheet": sheet_text is not None})
                 else:
-                    with open(full, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                self._json_response(200, {"content": content, "mime": mime, "size": stat.st_size, "path": rel_path, "sheet": sheet_text is not None})
+                    import base64
+                    with open(full, "rb") as f:
+                        data = base64.b64encode(f.read()).decode()
+                    self._json_response(200, {"content": data, "mime": mime, "size": stat.st_size, "path": rel_path, "binary": True})
             except OSError:
                 self._json_response(500, {"error": "read failed"})
-        else:
-            import base64
-            with open(full, "rb") as f:
-                data = base64.b64encode(f.read()).decode()
-            self._json_response(200, {"content": data, "mime": mime, "size": stat.st_size, "path": rel_path, "binary": True})
 
     def _sheet_as_text(self, full):
         try:
@@ -780,7 +983,11 @@ class Handler(SimpleHTTPRequestHandler):
             if not full:
                 self._json_response(400, {"error": "invalid path"})
                 return
-            os.makedirs(full, exist_ok=True)
+            try:
+                os.makedirs(full, exist_ok=True)
+            except OSError:
+                self._json_response(409, {"error": "cannot create directory"})
+                return
             self._json_response(200, {"ok": True})
             return
         self._json_response(400, {"error": "use PUT to write files, POST with {chatId, mkdir} to create dirs"})
@@ -800,16 +1007,35 @@ class Handler(SimpleHTTPRequestHandler):
         if not full:
             self._json_response(400, {"error": "invalid path"})
             return
-        with _get_file_lock(chat_id):
-            os.makedirs(os.path.dirname(full), exist_ok=True)
+        entry = _exclusive_chat_acquire(chat_id, timeout=RUN_TIMEOUT + 5)
+        if entry is None:
+            self._json_response(409, {"error": "a script run is in progress for this chat"})
+            return
+        try:
+            try:
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+            except OSError:
+                self._json_response(409, {"error": "cannot create directory"})
+                return
 
             if body.get("append"):
                 content = body.get("content", "")
                 if not isinstance(content, str):
                     self._json_response(400, {"error": "content must be a string"})
                     return
+                if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "append content too large"})
+                    return
+                existing = 0
+                if os.path.exists(full):
+                    existing = os.path.getsize(full)
+                if existing + len(content.encode("utf-8")) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "file too large"})
+                    return
                 with open(full, "a", encoding="utf-8") as f:
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
                 self._json_response(200, {"ok": True, "path": rel, "appended": True})
                 return
 
@@ -822,39 +1048,81 @@ class Handler(SimpleHTTPRequestHandler):
                 if not os.path.exists(full):
                     self._json_response(404, {"error": "file does not exist"})
                     return
+                if os.path.getsize(full) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "file too large"})
+                    return
                 with open(full, "r", encoding="utf-8") as f:
                     content = f.read()
                 if old not in content:
                     self._json_response(404, {"error": "old text not found in file"})
                     return
                 content = content.replace(old, new, 1)
-                with open(full, "w", encoding="utf-8") as f:
-                    f.write(content)
+                if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "file too large"})
+                    return
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(full), prefix=".tmp-", suffix=".edit")
+                try:
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, full)
+                except Exception:
+                    try: os.unlink(tmp_path)
+                    except OSError: pass
+                    raise
                 self._json_response(200, {"ok": True, "path": rel, "edited": True})
                 return
 
             content = body.get("content", "")
             if isinstance(content, str):
-                with open(full, "w", encoding="utf-8") as f:
-                    f.write(content)
+                if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "file too large"})
+                    return
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(full), prefix=".tmp-", suffix=".write")
+                try:
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, full)
+                except Exception:
+                    try: os.unlink(tmp_path)
+                    except OSError: pass
+                    raise
             elif isinstance(content, bytes):
+                if len(content) > MAX_FILE_SIZE * 2:
+                    self._json_response(413, {"error": "file too large"})
+                    return
                 try:
                     import base64
                     data = base64.b64decode(content)
                 except Exception:
                     self._json_response(400, {"error": "invalid base64 content"})
                     return
-                with open(full, "wb") as f:
-                    f.write(data)
+                if len(data) > MAX_FILE_SIZE:
+                    self._json_response(413, {"error": "file too large"})
+                    return
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(full), prefix=".tmp-", suffix=".write")
+                try:
+                    with os.fdopen(tmp_fd, "wb") as f:
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, full)
+                except Exception:
+                    try: os.unlink(tmp_path)
+                    except OSError: pass
+                    raise
             else:
                 self._json_response(400, {"error": "invalid base64 content"})
                 return
             self._json_response(200, {"ok": True, "path": rel})
+        finally:
+            _exclusive_chat_release(entry)
 
     def _handle_files_run(self, body=None):
-        if not RUN_SEM.acquire(timeout=1):
-            self._json_response(503, {"error": "too many concurrent runs"})
-            return
+        run_sem_held = False
         try:
             if body is None:
                 body = self._read_body()
@@ -868,6 +1136,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             rel = body.get("path", "").strip("/")
             stdin_data = body.get("stdin", "")
+            if not isinstance(stdin_data, str):
+                self._json_response(400, {"error": "stdin must be a string"})
+                return
             full = safe_path(rel, chat_id)
             if not full:
                 self._json_response(400, {"error": "invalid path"})
@@ -893,14 +1164,84 @@ class Handler(SimpleHTTPRequestHandler):
             if not cmd:
                 self._json_response(400, {"error": "unsupported file type"})
                 return
-            with _get_file_lock(chat_id):
+            # Wait for any active run OUTSIDE the lock (GETs stay responsive),
+            # then hold the lock to mark this run active: writers observe the
+            # marker instead of blocking on a 30s subprocess. RUN_SEM is taken
+            # only after the marker, so waiting never occupies a global slot.
+            deadline = time.monotonic() + RUN_TIMEOUT + 5
+            while True:
+                if not _wait_runs_idle(chat_id, max(0.0, deadline - time.monotonic())):
+                    self._json_response(409, {"error": "another run is still in progress for this chat"})
+                    return
+                entry = _get_file_lock(chat_id)
+                entry[0].acquire()
+                if RUN_STATE.get(chat_id, 0) == 0:
+                    break
+                entry[0].release()
+                _release_file_lock(entry)
+            try:
+                _run_state_begin(chat_id)
+            finally:
+                entry[0].release()
+                _release_file_lock(entry)
+            if not RUN_SEM.acquire(timeout=1):
+                _run_state_end(chat_id)
+                self._json_response(503, {"error": "too many concurrent runs"})
+                return
+            run_sem_held = True
+            try:
                 out_fd, out_path = tempfile.mkstemp(prefix="gooey-run-out-", suffix=".log")
-                err_fd, err_path = tempfile.mkstemp(prefix="gooey-run-err-", suffix=".log")
                 try:
-                    with os.fdopen(out_fd, "wb") as out_f, os.fdopen(err_fd, "wb") as err_f:
-                        proc = subprocess.Popen(
-                            cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f, cwd=chat_dir
-                        )
+                    err_fd, err_path = tempfile.mkstemp(prefix="gooey-run-err-", suffix=".log")
+                except Exception:
+                    os.close(out_fd)
+                    try: os.unlink(out_path)
+                    except OSError: pass
+                    raise
+                try:
+                    out_f = os.fdopen(out_fd, "wb")
+                except Exception:
+                    os.close(out_fd)
+                    try: os.unlink(out_path)
+                    except OSError: pass
+                    try: os.unlink(err_path)
+                    except OSError: pass
+                    raise
+                try:
+                    err_f = os.fdopen(err_fd, "wb")
+                except Exception:
+                    out_f.close()
+                    os.close(err_fd)
+                    try: os.unlink(out_path)
+                    except OSError: pass
+                    try: os.unlink(err_path)
+                    except OSError: pass
+                    raise
+                try:
+                    with out_f, err_f:
+                        env = {
+                            'PATH': os.environ.get('PATH', ''),
+                            'HOME': chat_dir,
+                            'TMPDIR': chat_dir,
+                            'LANG': os.environ.get('LANG', 'C.UTF-8'),
+                            'LC_ALL': os.environ.get('LC_ALL', 'C.UTF-8'),
+                        }
+                        def _run_limits():
+                            # Cap output-file size so a runaway script can't fill the disk.
+                            if resource is not None:
+                                try:
+                                    resource.setrlimit(resource.RLIMIT_FSIZE, (RUN_OUT_MAX, RUN_OUT_MAX))
+                                except (ValueError, OSError):
+                                    pass
+                        try:
+                            proc = subprocess.Popen(
+                                cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f, cwd=chat_dir, env=env,
+                                start_new_session=True, preexec_fn=_run_limits
+                            )
+                        except TypeError:
+                            proc = subprocess.Popen(
+                                cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f, cwd=chat_dir, env=env
+                            )
                         try:
                             proc.communicate(
                                 input=stdin_data.encode("utf-8", "replace") if stdin_data else None,
@@ -908,9 +1249,19 @@ class Handler(SimpleHTTPRequestHandler):
                             )
                         except subprocess.TimeoutExpired:
                             try:
-                                proc.kill()
+                                # Only kill the process group if the child is its
+                                # own group leader (start_new_session worked) —
+                                # otherwise killpg could hit the server's group.
+                                pgid = os.getpgid(proc.pid)
+                                if pgid == proc.pid:
+                                    os.killpg(pgid, 9)
+                                else:
+                                    proc.kill()
                             except OSError:
-                                pass
+                                try:
+                                    proc.kill()
+                                except OSError:
+                                    pass
                             try:
                                 proc.communicate()
                             except Exception:
@@ -923,6 +1274,8 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json_response(500, {"error": f"interpreter not found: {cmd[0]}"})
                     return
                 except Exception:
+                    print("[run] exception", file=sys.stderr)
+                    traceback.print_exc()
                     self._json_response(500, {"error": "run failed"})
                     return
                 finally:
@@ -935,8 +1288,11 @@ class Handler(SimpleHTTPRequestHandler):
                     "stderr": stderr_text,
                     "exit_code": proc.returncode
                 })
+            finally:
+                _run_state_end(chat_id)
         finally:
-            RUN_SEM.release()
+            if run_sem_held:
+                RUN_SEM.release()
 
     def _handle_files_delete(self):
         chat_id = self._get_chat_id_qs()
@@ -954,22 +1310,53 @@ class Handler(SimpleHTTPRequestHandler):
         if full == os.path.realpath(_chat_sandbox(chat_id)):
             self._json_response(400, {"error": "cannot delete chat sandbox root"})
             return
-        if not os.path.exists(full):
-            self._json_response(404, {"error": "not found"})
+        entry = _exclusive_chat_acquire(chat_id, timeout=RUN_TIMEOUT + 5)
+        if entry is None:
+            self._json_response(409, {"error": "a script run is in progress for this chat"})
             return
         try:
-            if os.path.isdir(full):
-                shutil.rmtree(full)
-            else:
-                os.unlink(full)
-        except OSError:
-            self._json_response(500, {"error": "delete failed"})
-            return
+            if not os.path.exists(full):
+                self._json_response(404, {"error": "not found"})
+                return
+            try:
+                if os.path.isdir(full):
+                    shutil.rmtree(full)
+                else:
+                    os.unlink(full)
+            except OSError:
+                self._json_response(500, {"error": "delete failed"})
+                return
+        finally:
+            _exclusive_chat_release(entry)
         self._json_response(200, {"ok": True})
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a connection-thread cap (slowloris/OOM guard)."""
+    request_queue_size = 64
+
+    def process_request(self, request, client_address):
+        # Acquire before spawning the thread so thread count stays bounded.
+        if not MAX_CONN_SEM.acquire(timeout=5):
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            MAX_CONN_SEM.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            MAX_CONN_SEM.release()
 
 if __name__ == "__main__":
     try:
-        with ThreadingHTTPServer((HOST, PORT), Handler) as server:
+        with BoundedThreadingHTTPServer((HOST, PORT), Handler) as server:
             print(f"Serving at http://{HOST}:{PORT}")
             server.serve_forever()
     except KeyboardInterrupt:
