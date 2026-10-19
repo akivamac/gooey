@@ -201,6 +201,26 @@
     (m.searchCards || []).forEach(c => (c.results || []).forEach(r => { if (r.url && urls.indexOf(r.url) === -1) urls.push(r.url); }));
     return urls.length ? '\n\nSources: ' + urls.join(', ') : '';
   }
+  // Issue #88: evolving status text to the right of the gooing dots
+  let gooeyLabelTimer = null;
+  function clearGooeyLabel() { if (gooeyLabelTimer) { clearInterval(gooeyLabelTimer); gooeyLabelTimer = null; } }
+  function startGooeyLabel(loaderEl) {
+    clearGooeyLabel();
+    const label = loaderEl && loaderEl.querySelector('.gooey-label');
+    if (!label) return;
+    const t0 = Date.now();
+    const tick = () => {
+      if (!label.isConnected) { clearGooeyLabel(); return; }
+      const s = (Date.now() - t0) / 1000;
+      label.textContent = s >= 90 ? 'Reasoning...' : s >= 45 ? 'Thinking about your request...' : 'Thinking...';
+    };
+    tick();
+    gooeyLabelTimer = setInterval(tick, 1000);
+  }
+  function removeGooeyLoader() {
+    clearGooeyLabel();
+    try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+  }
   function abortIfStreaming() {
     const cids = Object.keys(streamingChats);
     cids.forEach(cid => {
@@ -209,7 +229,7 @@
       if (ac) ac.abort();
     });
     cids.forEach(cid => endStreamState(cid, cid === activeChatId));
-    try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+    removeGooeyLoader();
     cancelTitleGen();
   }
   function performFileOp(op, chatId) {
@@ -967,7 +987,9 @@
       } else {
         row.className = 'message message-assistant';
         const isLast = m === msgs[msgs.length - 1];
-        const actions = isLast && msgs.length >= 2 ? '<div class="msg-actions"><button class="msg-action-btn" data-action="regenerate">&#8634; Regenerate</button><button class="msg-action-btn" data-action="copy-msg">Copy</button></div>' : '<div class="msg-actions"><button class="msg-action-btn" data-action="copy-msg">Copy</button></div>';
+        const copyBtn = '<button class="msg-action-btn" data-action="copy-msg">⧉ Copy</button>';
+        const retryBtn = '<button class="msg-action-btn" data-action="regenerate">⟳ Retry</button>';
+        const actions = `<div class="msg-actions">${copyBtn}${isLast && msgs.length >= 2 ? retryBtn : ''}</div>`;
         const cleanContent = stripFileOps(m.content);
         row.innerHTML = `<div class="content">${renderMd(cleanContent)}</div>${actions}`;
         const contentEl = row.querySelector('.content');
@@ -1094,7 +1116,7 @@
         if (sac) sac.abort();
         bumpResumeToken(targetChatId);
         endStreamState(targetChatId, true);
-        try { const loader = document.getElementById('gooey-loading'); if (loader) loader.remove(); } catch {}
+        removeGooeyLoader();
         cancelTitleGen();
         return;
       } else {
@@ -1192,8 +1214,9 @@
       const loaderDiv = document.createElement('div');
       loaderDiv.className = 'message message-assistant';
       loaderDiv.id = 'gooey-loading';
-      loaderDiv.innerHTML = '<div class="gooey-loader"><div class="gooey-ball"></div><div class="gooey-ball"></div><div class="gooey-ball"></div></div>';
+      loaderDiv.innerHTML = '<div class="gooey-loader"><div class="gooey-ball"></div><div class="gooey-ball"></div><div class="gooey-ball"></div><span class="gooey-label"></span></div>';
       chatInner.appendChild(loaderDiv);
+      startGooeyLabel(loaderDiv); // #88: timeline starts when indicator appears
       scrollBottom();
     }
     let firstToken = true;
@@ -1357,8 +1380,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           if (obj.error) { streamError = obj.error; break outer; }
           if (obj.message && obj.message.content) {
             if (firstToken) {
-              const loader = document.getElementById('gooey-loading');
-              if (loader) loader.remove();
+              removeGooeyLoader();
               firstToken = false;
             }
             conv.messages[myMsgIdx].content += obj.message.content;
@@ -1447,8 +1469,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
           if (obj.error) { streamError = obj.error; }
           else if (obj.message && obj.message.content) {
             if (firstToken) {
-              const loader = document.getElementById('gooey-loading');
-              if (loader) loader.remove();
+              removeGooeyLoader();
               firstToken = false;
             }
             conv.messages[myMsgIdx].content += obj.message.content;
@@ -1537,7 +1558,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         }
         if (firstToken && !String(lastMsgE.content || '').trim()) {
           const ldrE = document.getElementById('gooey-loading');
-          if (ldrE) ldrE.remove();
+          if (ldrE) removeGooeyLoader();
           lastMsgE.content = '*[no response]*';
           updateContent(lastMsgE.content);
         }
@@ -1552,7 +1573,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         const lastMsg = conv.messages[conv.messages.length - 1];
         if (conv.messages[myMsgIdx] === lastMsg && lastMsg && lastMsg.role === 'assistant') {
           const loader = document.getElementById('gooey-loading');
-          if (loader) loader.remove();
+          if (loader) removeGooeyLoader();
           const pendingOpsC = persistAbortedFileOps(lastMsg);
           if (!lastMsg.content) lastMsg.content += timedOut ? '*[stopped: timed out]*' : '*[stopped]*';
           else lastMsg.content += timedOut ? '\n\n*[stopped: timed out]*' : '\n\n*[stopped]*';
@@ -1581,7 +1602,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
         const errMsg = e.message || 'failed to reach Ollama';
         const lastErrMsg = conv.messages[myMsgIdx] || conv.messages[conv.messages.length - 1];
         const ldrErr = document.getElementById('gooey-loading');
-        if (ldrErr) ldrErr.remove();
+        if (ldrErr) removeGooeyLoader();
         if (lastErrMsg) {
           lastErrMsg.content = `*Error: ${errMsg}*`;
           updateContent(lastErrMsg.content);
@@ -1800,19 +1821,75 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
   }
 
   // --- AI-powered conversation compaction ---
+  let compactRowEl = null, compactTickTimer = null, compactEstTimer = null;
+  let compactStart = 0, compactEstTotal = 30000, compactShown = 0, compactHidLoader = false;
+
+  function setCompactProgress(pct) {
+    if (!compactRowEl) return;
+    const fill = compactRowEl.querySelector('.compact-bar-fill');
+    if (fill) fill.style.width = pct + '%';
+    const pctEl = compactRowEl.querySelector('.compact-pct');
+    if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+  }
+
   function showCompactUI() {
     const banner = document.getElementById('compact-banner');
-    banner.classList.add('active');
-    const fill = document.getElementById('compact-progress-fill');
-    fill.classList.add('indeterminate');
-    fill.style.width = '';
+    if (banner) {
+      banner.classList.add('active');
+      const fill = document.getElementById('compact-progress-fill');
+      if (fill) { fill.classList.add('indeterminate'); fill.style.width = ''; }
+    }
+    // Suppress the gooing-dots loader while compacting
+    compactHidLoader = false;
+    const loader = document.getElementById('gooey-loading');
+    if (loader && loader.style.display !== 'none') { loader.style.display = 'none'; compactHidLoader = true; }
+    // In-chat status row: symbol + text + progress bar + percentage
+    if (compactRowEl) { compactRowEl.remove(); compactRowEl = null; }
+    const chatInner = document.getElementById('chat-inner');
+    if (chatInner) {
+      compactRowEl = document.createElement('div');
+      compactRowEl.className = 'compact-status-row';
+      compactRowEl.innerHTML = '<span class="compact-icon">🗜️</span><span class="compact-text">Compacting conversation so we can keep chatting...</span><span class="compact-bar"><span class="compact-bar-fill"></span></span><span class="compact-pct">0%</span>';
+      chatInner.appendChild(compactRowEl);
+      try { scrollBottom(); } catch {}
+    }
+    compactStart = Date.now();
+    compactEstTotal = 30000;
+    compactShown = 0;
+    setCompactProgress(0);
+    // Re-estimate total duration every 30s based on elapsed time
+    if (compactEstTimer) clearInterval(compactEstTimer);
+    compactEstTimer = setInterval(() => {
+      const elapsed = Date.now() - compactStart;
+      compactEstTotal = Math.min(300000, Math.max(30000, elapsed * 1.6));
+    }, 30000);
+    // Bar visibly advances every 3s, interpolating toward the current estimate
+    if (compactTickTimer) clearInterval(compactTickTimer);
+    compactTickTimer = setInterval(() => {
+      if (!compactRowEl) return;
+      const target = Math.min(97, (Date.now() - compactStart) / compactEstTotal * 100);
+      compactShown = Math.min(target, compactShown + Math.max(1, (target - compactShown) / 3));
+      setCompactProgress(compactShown);
+    }, 3000);
   }
   function hideCompactUI() {
+    if (compactTickTimer) { clearInterval(compactTickTimer); compactTickTimer = null; }
+    if (compactEstTimer) { clearInterval(compactEstTimer); compactEstTimer = null; }
     const banner = document.getElementById('compact-banner');
-    banner.classList.remove('active');
+    if (banner) banner.classList.remove('active');
     const fill = document.getElementById('compact-progress-fill');
-    fill.classList.remove('indeterminate');
-    fill.style.width = '0%';
+    if (fill) { fill.classList.remove('indeterminate'); fill.style.width = '0%'; }
+    if (compactRowEl) {
+      setCompactProgress(100);
+      const el = compactRowEl;
+      compactRowEl = null;
+      setTimeout(() => { try { el.remove(); } catch {} }, 500);
+    }
+    if (compactHidLoader) {
+      const loader = document.getElementById('gooey-loading');
+      if (loader) loader.style.display = '';
+      compactHidLoader = false;
+    }
   }
 
   async function aiSummarizeWhole(messages, model, contextMsg, maxSummaryTokens) {
@@ -2387,7 +2464,7 @@ Rules: NEVER wrap tags in code fences (no \`\`\`xml, \`\`\`text, etc.) — emit 
       navigator.clipboard.writeText(content).then(() => {
         t.textContent = 'Copied!';
         t.classList.add('copied');
-        setTimeout(() => { t.textContent = 'Copy'; t.classList.remove('copied'); }, 1500);
+        setTimeout(() => { t.textContent = '⧉ Copy'; t.classList.remove('copied'); }, 1500);
       });
       return;
     }
